@@ -117,6 +117,18 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n]) + "…（已截断）"
 }
 
+// verifierBoundTools are the tools bound to the verifier agent at seed time. Kept as a
+// named list because it is a contract with hostTools(): binding a name that hostTools()
+// does not produce leaves the agent with a tool it can never call, and the model then
+// degrades into echoing the tool's name as a shell command instead of invoking it.
+// TestHostToolsCoverVerifierBindings enforces that.
+var verifierBoundTools = []string{
+	"list_candidate_findings", "record_finding_verification",
+	"get_task_node_detail", "list_task_findings",
+	"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
+	"get_task_graph",
+}
+
 // seedVerifierAgent provisions the "漏洞验证" agent plus its report_finding trigger.
 // Mirrors seedReporterAgent: builtin=false (editable/deletable in the UI), guarded by a
 // one-shot settings flag so a deliberate deletion is not undone on the next restart.
@@ -158,12 +170,7 @@ func (s *Server) seedVerifierAgent() {
 		log.Printf("[verifier] 设置触发运行策略失败: %v", err)
 	}
 	// 读原始证据所需的只读工具（复现本身用 chat agent 自带的 Bash / WebFetch）。
-	if err := s.m.pg.AddAgentToToolBinding(db.VerifierAgentKey, []string{
-		"list_candidate_findings", "record_finding_verification",
-		"get_task_node_detail", "list_task_findings",
-		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
-		"get_task_graph",
-	}); err != nil {
+	if err := s.m.pg.AddAgentToToolBinding(db.VerifierAgentKey, verifierBoundTools); err != nil {
 		log.Printf("[verifier] 绑定工具失败: %v", err)
 	}
 	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{

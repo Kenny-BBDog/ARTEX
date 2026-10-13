@@ -40,6 +40,13 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
+	// verifier 的两个工具必须也在这里。seedVerifierAgent 只把它们写进 tools 目录并绑定给
+	// verifier agent，而 agent 真正能调用的工具对象来自本函数——少了这一行，绑定名在运行时
+	// 解析不到任何东西，模型只会把工具名当 shell 命令 echo 出来（实测退化循环）。
+	tools = append(tools, s.findingVerificationTools()...)
+	// verifier 的两个工具必须也在这里。seedVerifierAgent 只把它们写进 tools 目录并绑定给
+	// verifier agent，而 agent 真正能调用的工具对象来自本函数——少了这一行，绑定名在运行时
+	// 解析不到任何东西，模型只会把工具名当 shell 命令 echo 出来（实测退化循环）。
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	custom, err := s.customTools()
 	if err != nil {
