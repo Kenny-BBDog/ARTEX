@@ -64,6 +64,7 @@ const severity: Record<string, StatusMeta> = {
 };
 
 const finding: Record<string, StatusMeta> = {
+  candidate: { label: "待验证", tone: "amber" },
   pending: { label: "待处理", tone: "amber" },
   in_progress: { label: "处理中", tone: "blue" },
   confirmed: { label: "已确认", tone: "red" },

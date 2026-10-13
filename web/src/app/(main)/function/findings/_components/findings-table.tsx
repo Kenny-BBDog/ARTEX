@@ -43,6 +43,7 @@ import { cn } from "@/lib/utils";
 export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 
 export const FINDING_STATUSES: FindingStatus[] = [
+  "candidate",
   "pending",
   "in_progress",
   "confirmed",

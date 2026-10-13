@@ -275,6 +275,7 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if err := pg.SeedPromptIfEmpty(a.ID, agent.DefaultAssistantPrompt); err != nil {
 		log.Printf("[agents] seed starter prompt for %s 失败: %v", a.Key, err)
 	}
+	s.invalidateTaskAgents()
 	writeJSON(w, 200, agentDTO(a))
 }
 
@@ -326,6 +327,8 @@ func (s *Server) pgDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	if err := pg.DeleteTriggersForAgent(a.Key); err != nil {
 		log.Printf("[agents] 清理 %s 触发器失败: %v", a.Key, err)
 	}
+	// Drop cached provider bundles and agent→profile bindings for the removed key.
+	s.invalidateTaskAgents()
 	writeJSON(w, 200, map[string]any{"deleted": a.Key})
 }
 
@@ -1912,6 +1915,8 @@ func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
 					}
 				}
 				task.Notify()
+				// Intents were just reopened to 'open' — wake the pool to claim them.
+				task.NotifyWorker()
 			}
 		}
 	}

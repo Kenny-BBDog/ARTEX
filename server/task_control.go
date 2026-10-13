@@ -199,6 +199,7 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 			return out, fmt.Errorf("%w: 意图不再是 paused 状态", db.ErrIntentStateConflict)
 		}
 		t.Notify()
+		t.NotifyWorker() // the intent is claimable again
 		out.State = "open"
 	case "cancel":
 		// 删除支持两种模式:

@@ -469,8 +469,10 @@ export interface TaskConstraint {
 // ---- Findings ----
 export type Severity = "critical" | "high" | "medium" | "low";
 
-// 漏洞处置状态:待处理 / 处理中 / 已确认 / 已处理 / 已修复 / 误报 / 忽略 / 重复 / 风险接受。
+// 漏洞处置状态:待验证 / 待处理 / 处理中 / 已确认 / 已处理 / 已修复 / 误报 / 忽略 / 重复 / 风险接受。
+// candidate = worker 自报、尚未通过独立验证；只有 confirmed 能作为目标达成证据。
 export type FindingStatus =
+  | "candidate"
   | "pending"
   | "in_progress"
   | "confirmed"

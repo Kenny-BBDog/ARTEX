@@ -207,7 +207,9 @@ func TestRetestHTTPThroughConversationAndTools(t *testing.T) {
 		t.Fatal("unexpected LLM calls", calls.Load())
 	}
 	f, _ := s.m.pg.GetFinding(fid)
-	if f.Status != db.FindingPending || f.Evidence != "original proof" {
+	// 复测结论 inconclusive 不改动原漏洞：其处置状态仍是新登记的初始态 candidate，
+	// 原始证据也不该被复测覆盖。
+	if f.Status != db.FindingCandidate || f.Evidence != "original proof" {
 		t.Fatal("source modified")
 	}
 	listing := retestRequest(s.listFindingRetests, "GET", fid, "")

@@ -404,7 +404,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// — hidden() only folds a member out when it is covered AND still cold. Computed
 	// every round (cheap for real graph sizes); nil map degrades safely.
 	var hotAtRender map[int64]bool
-	if cg, _, err := loadColdGraph(t.ts); err == nil {
+	if cg, _, err := loadColdGraphCached(t.ts); err == nil {
 		hotAtRender = cg.hotSet()
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
@@ -1154,6 +1154,38 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+// requireVerifiedFinding blocks a finding from being used as proof that a goal is met
+// until it has been independently reproduced.
+//
+// A worker can call report_finding on its own word alone. Before this check that was
+// enough for the planner to prove a goal, which marks the task done and cancels every
+// running worker — so "the task succeeded" rested entirely on the model's own claim,
+// the one signal a benchmark would most want to trust.
+//
+// Escape hatch: with no verifier agent enabled nothing would ever promote a candidate,
+// so refusing one would deadlock every finding-based goal. In that case the
+// pre-verification behaviour is kept and the outcome table records the finding as
+// claimed-but-unconfirmed rather than stalling the run.
+func (t *ToolSet) requireVerifiedFinding(nodeID int64) error {
+	if t.ts == nil {
+		return nil
+	}
+	status, err := t.ts.FindingStatusByNodeID(nodeID)
+	if err != nil {
+		return fmt.Errorf("校验漏洞验证状态失败：%v", err)
+	}
+	if status == "" || status == db.FindingConfirmed {
+		// "" = finding node with no findings row to judge; not reachable via
+		// report_finding, which always writes both.
+		return nil
+	}
+	enabled, err := t.ts.VerificationEnabled()
+	if err != nil || !enabled {
+		return nil // 验证未启用：保持既有行为，避免任务永久无法收官
+	}
+	return fmt.Errorf("漏洞 #%d 尚未通过独立验证（当前状态 %s），不能作为目标达成的证据；请派一条验证意图、或等 verifier 出结论后再 prove_goal", nodeID, status)
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
 		obj(map[string]any{
@@ -1179,6 +1211,11 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			if evidenceNode.Kind == db.KindFinding {
+				if err := t.requireVerifiedFinding(evidenceNode.ID); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")

@@ -548,15 +548,16 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	}
 
 	// 改成同一个状态：不该产生事件（避免重复提交刷出推送噪音）。
-	from, found, notified, err := d.SetFindingStatusWithNotify(ctx, f.FindingID, "pending")
+	// 新登记的漏洞初始状态是 candidate（待独立验证），见 FindingCandidate。
+	from, found, notified, err := d.SetFindingStatusWithNotify(ctx, f.FindingID, FindingCandidate)
 	if err != nil || !found {
 		t.Fatalf("状态设置失败: found=%v err=%v", found, err)
 	}
 	if notified {
 		t.Fatal("状态未变化时不应登记推送事件")
 	}
-	if from != "pending" {
-		t.Fatalf("应返回变更前状态 pending，得到 %q", from)
+	if from != FindingCandidate {
+		t.Fatalf("应返回变更前状态 %s，得到 %q", FindingCandidate, from)
 	}
 
 	// 真正变更：应登记事件并记录 from/to。
@@ -567,8 +568,8 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if !notified {
 		t.Fatal("状态实际变更时应登记推送事件")
 	}
-	if from != "pending" {
-		t.Fatalf("from 应为 pending，得到 %q", from)
+	if from != FindingCandidate {
+		t.Fatalf("from 应为 %s，得到 %q", FindingCandidate, from)
 	}
 	var snapshot []byte
 	if err := d.QueryRow(`SELECT snapshot FROM notification_events WHERE finding_id=$1 AND kind=$2`,
@@ -579,7 +580,7 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if err := json.Unmarshal(snapshot, &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.FromStatus != "pending" || snap.ToStatus != "fixed" {
+	if snap.FromStatus != FindingCandidate || snap.ToStatus != "fixed" {
 		t.Fatalf("快照里的状态流转不对: %s → %s", snap.FromStatus, snap.ToStatus)
 	}
 	// 快照要带上渲染所需字段，否则状态变更消息会是空壳。
@@ -864,7 +865,7 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if err := json.Unmarshal(snapshot, &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.FromStatus != "pending" || snap.ToStatus != FindingFixed {
+	if snap.FromStatus != FindingCandidate || snap.ToStatus != FindingFixed {
 		t.Fatalf("快照的状态流转不对: %s → %s", snap.FromStatus, snap.ToStatus)
 	}
 	// 快照要带渲染所需字段，否则推送出来是空壳。

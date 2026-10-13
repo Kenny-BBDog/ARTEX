@@ -114,6 +114,16 @@ type Server struct {
 	taskAgentMu sync.Mutex
 	taskAgents  map[string]*taskAgentBundle
 
+	// agentBindingByKey memoizes each agent key's configured LLM profile binding.
+	// effectiveProfileForAgent sits on the worker's idle-poll path and resolves every
+	// role on every iteration; without this each poll costs one SELECT per role. A nil
+	// value is a real entry meaning "the agent exists but binds no profile", so a
+	// cached negative is not re-queried. Only successful lookups are stored, so a
+	// transient DB error keeps the previous (uncached) fall-through behaviour.
+	// Cleared wherever agents or profiles change, via invalidateTaskAgents.
+	agentBindMu       sync.RWMutex
+	agentBindingByKey map[string]*int64
+
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
@@ -485,6 +495,8 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// wake the active task so a task created while idle starts exploring.
 	if t := s.m.ActiveTask(); t != nil {
 		t.Notify()
+		// Workers blocked because no provider resolved yet must re-check now.
+		t.NotifyWorker()
 	}
 	return nil
 }
@@ -517,12 +529,49 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 // can't happen (FK ON DELETE SET NULL); an otherwise-invalid one is dropped downstream
 // by loadProfileConfig, letting the caller fall back.
 func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 {
-	if s.m.pg != nil && agentKey != "" {
-		if a, _ := s.m.pg.GetAgentByKey(agentKey); a != nil && a.LLMProfileID != nil {
-			return a.LLMProfileID
-		}
+	if s.m.pg == nil || agentKey == "" {
+		return pinID
+	}
+	if bound, ok := s.cachedAgentBinding(agentKey); ok && bound != nil {
+		return bound
 	}
 	return pinID
+}
+
+// cachedAgentBinding returns the profile id an agent is bound to, memoized.
+// ok=false means "no cached answer" (nil DB, or the lookup failed) — the caller then
+// uses pinID, exactly as the uncached code did. A non-nil ok with a nil id means the
+// agent genuinely has no binding.
+func (s *Server) cachedAgentBinding(agentKey string) (bound *int64, ok bool) {
+	s.agentBindMu.RLock()
+	bound, ok = s.agentBindingByKey[agentKey]
+	s.agentBindMu.RUnlock()
+	if ok {
+		return bound, true
+	}
+
+	a, err := s.m.pg.GetAgentByKey(agentKey)
+	if err != nil {
+		return nil, false // transient failure: don't memoize it
+	}
+	if a != nil && a.LLMProfileID != nil {
+		bound = a.LLMProfileID
+	}
+
+	s.agentBindMu.Lock()
+	if s.agentBindingByKey == nil {
+		s.agentBindingByKey = map[string]*int64{}
+	}
+	s.agentBindingByKey[agentKey] = bound
+	s.agentBindMu.Unlock()
+	return bound, true
+}
+
+// invalidateAgentBindings drops the memoized agent→profile bindings.
+func (s *Server) invalidateAgentBindings() {
+	s.agentBindMu.Lock()
+	s.agentBindingByKey = map[string]*int64{}
+	s.agentBindMu.Unlock()
 }
 
 // resolveChatAgent picks the ChatAgent for one conversation: the agent's own
@@ -699,6 +748,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/restore/batch", s.restoreTaskArchivesBatch)
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
+	mux.HandleFunc("GET /api/tasks/{id}/outcome", s.getTaskOutcome)
+	mux.HandleFunc("GET /api/outcomes", s.listTaskOutcomes)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
@@ -763,6 +814,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/verifications", s.listFindingVerifications)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
@@ -1583,6 +1635,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// live slot and postpones an unavailable task's pause/queue transition until
 	// the call returns; a nudge lets an idle running task resume promptly.
 	t.Notify()
+	t.NotifyWorker() // the new binding may be what unblocks an idle worker
 	go s.reconcileConcurrency()
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{

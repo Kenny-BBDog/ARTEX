@@ -51,6 +51,7 @@ func (sc *Scheduler) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			sc.s.reconcileConcurrency() // 并发上限:有空位就把排队任务补位启动
+			sc.refreshOutcomes(ctx)
 			sc.step()
 		}
 	}
@@ -111,6 +112,46 @@ func (sc *Scheduler) init() {
 			}
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastTaskCreate, strconv.FormatInt(maxID, 10))
+	}
+}
+
+// outcomeGrace is how long a terminal task is left alone before its outcome is computed.
+// A task is marked done BEFORE its running workers are cancelled, so they keep writing
+// for a short while after; computing at the instant of completion would systematically
+// undercount.
+const outcomeGrace = 30 * time.Second
+
+// outcomeBatch caps how many tasks one tick recomputes, so a backlog (e.g. the first
+// sweep after upgrading an existing database) is spread over several ticks instead of
+// stalling startup.
+const outcomeBatch = 50
+
+// refreshOutcomes computes the post-run summary for terminal tasks that need one.
+//
+// Driven from the scheduler tick rather than from the status transition, for two reasons:
+// the grace period above, and self-healing — a task that finished while the server was
+// down is picked up on the next pass. There is deliberately no manual recompute endpoint;
+// this is the only writer.
+func (sc *Scheduler) refreshOutcomes(ctx context.Context) {
+	ids, err := sc.pg.TasksNeedingOutcome(outcomeGrace, outcomeBatch)
+	if err != nil || len(ids) == 0 {
+		return
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		o, err := sc.pg.ComputeTaskOutcome(ctx, id)
+		if err != nil {
+			log.Printf("[outcome] task %d 汇总失败: %v", id, err)
+			continue
+		}
+		if o == nil {
+			continue // 任务已不存在
+		}
+		if err := sc.pg.UpsertTaskOutcome(ctx, o); err != nil {
+			log.Printf("[outcome] task %d 落库失败: %v", id, err)
+		}
 	}
 }
 

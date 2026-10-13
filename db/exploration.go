@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -174,6 +176,57 @@ type ExplorationStore struct {
 	expID int64
 }
 
+// graphVersions holds one monotonic counter per exploration, bumped by every write
+// that can change what an in-memory snapshot of the graph would contain: new/removed
+// nodes, new edges/anchors, and any node state transition.
+//
+// It exists because content_version CANNOT serve as a whole-graph version: that column
+// only moves on a handful of state writers (SetNodeState/SetIntentState/
+// CompareAndSetIntentState/SoftDeleteIntent) and misses AddNode (new rows start at 0),
+// Link/Anchor (new edges), and ClaimIntent (open→running) — yet readers such as the
+// planner's graph overview depend on intent state. See GraphVersion.
+//
+// Keyed by exploration id rather than stored on the struct because DB.Exploration(id)
+// hands out a fresh *ExplorationStore each call, so a per-instance field would let two
+// stores for the same exploration disagree.
+var graphVersions sync.Map // int64 (exploration id) -> *atomic.Uint64
+
+// graphVer returns this exploration's counter, creating it on first use.
+func (s *ExplorationStore) graphVer() *atomic.Uint64 {
+	if v, ok := graphVersions.Load(s.expID); ok {
+		return v.(*atomic.Uint64)
+	}
+	v, _ := graphVersions.LoadOrStore(s.expID, new(atomic.Uint64))
+	return v.(*atomic.Uint64)
+}
+
+// bumpGraph marks any cached graph snapshot for this exploration stale. Every write
+// method that touches exploration_nodes/exploration_edges/exploration_anchors — or a
+// node's state — must call it, or a reader may serve a stale snapshot.
+func (s *ExplorationStore) bumpGraph() { s.graphVer().Add(1) }
+
+// bumpGraphByExp is bumpGraph for write paths that run outside an *ExplorationStore
+// (e.g. the DB-level DeleteFinding, or an archive restore), where only the raw
+// exploration id is at hand. No-op for id <= 0.
+func bumpGraphByExp(expID int64) {
+	if expID <= 0 {
+		return
+	}
+	if v, ok := graphVersions.Load(expID); ok {
+		v.(*atomic.Uint64).Add(1)
+		return
+	}
+	v, _ := graphVersions.LoadOrStore(expID, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(1)
+}
+
+// GraphVersion returns a value that changes whenever this exploration's node/edge set
+// or any node state changes. Callers may use it as a cache key for derived graph views:
+// equal version ⇒ an earlier snapshot is still valid. A version read must be taken
+// BEFORE the corresponding snapshot read, so that a write landing in between bumps the
+// counter and invalidates the snapshot the caller is about to cache.
+func (s *ExplorationStore) GraphVersion() uint64 { return s.graphVer().Load() }
+
 // CreateExploration creates a new exploration root and returns its id.
 func (d *DB) CreateExploration(description, goal string) (int64, error) {
 	var id int64
@@ -213,7 +266,11 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 			return 0, err
 		}
 	}
-	return id, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.bumpGraph()
+	return id, nil
 }
 
 // AddIntent is a convenience: an open intent.
@@ -252,6 +309,9 @@ func (s *ExplorationStore) Anchor(nodeID, assetID int64) error {
 		return nil
 	}
 	_, err := s.db.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID)
+	if err == nil {
+		s.bumpGraph()
+	}
 	return err
 }
 
@@ -260,6 +320,9 @@ func (s *ExplorationStore) Link(from int64, rel string, to int64) error {
 	_, err := s.db.Exec(`
 INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
 ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, rel, to)
+	if err == nil {
+		s.bumpGraph()
+	}
 	return err
 }
 
@@ -267,6 +330,9 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	if err == nil {
+		s.bumpGraph()
+	}
 	return err
 }
 
@@ -286,6 +352,7 @@ func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) e
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("目标不存在")
 	}
+	s.bumpGraph()
 	return nil
 }
 
@@ -301,6 +368,7 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("目标不存在")
 	}
+	s.bumpGraph()
 	return nil
 }
 
@@ -316,6 +384,7 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	s.bumpGraph()
 	return n, nil
 }
 
@@ -332,6 +401,7 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	s.bumpGraph()
 	return n > 0, nil
 }
 
@@ -345,6 +415,7 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	s.bumpGraph()
 	return n, nil
 }
 
@@ -354,6 +425,9 @@ func (s *ExplorationStore) SetIntentState(id int64, state string) error {
 	_, err := s.db.Exec(`UPDATE exploration_nodes
 SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal)
+	if err == nil {
+		s.bumpGraph()
+	}
 	return err
 }
 
@@ -369,6 +443,9 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.
 		return false, err
 	}
 	n, err := res.RowsAffected()
+	if err == nil && n == 1 {
+		s.bumpGraph()
+	}
 	return n == 1, err
 }
 
@@ -422,7 +499,11 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 			summary = sm
 		}
 	}
-	return summary, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	s.bumpGraph()
+	return summary, nil
 }
 
 // CancelIntent 物理删除一个意图,以及"仅由该意图支撑"的全部独占子孙节点——从该意图沿
@@ -593,7 +674,11 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	if removed != int64(len(ids)) {
 		return out, fmt.Errorf("intent cleanup changed concurrently")
 	}
-	return out, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	s.bumpGraph()
+	return out, nil
 }
 
 type tokenUsageBucket struct {
@@ -1177,6 +1262,11 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	if n == 1 {
+		// open→running is a graph change readers depend on (open_intents /
+		// running_intents are rendered from state) even though no row content moves.
+		s.bumpGraph()
+	}
 	return n == 1, nil
 }
 

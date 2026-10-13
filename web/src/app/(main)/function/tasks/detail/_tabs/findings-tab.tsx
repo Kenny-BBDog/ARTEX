@@ -29,6 +29,7 @@ function findingLabel(finding: Finding): string {
 }
 
 const FINDING_STATUSES: FindingStatus[] = [
+  "candidate",
   "pending",
   "in_progress",
   "confirmed",

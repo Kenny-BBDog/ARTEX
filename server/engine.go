@@ -317,6 +317,7 @@ func (e *Engine) Resume(t *Task) {
 	}
 	e.paused.Delete(t.ID)
 	t.Notify()
+	t.NotifyWorker() // unpaused: idle workers may claim again right away
 }
 
 // execContextFor returns a live per-task context derived from parent, recreating
@@ -539,6 +540,11 @@ type steerHooks struct {
 	limit int
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
+	// recordIdleTurn, when set, persists one activity row per injected nudge. The count
+	// itself lives in memory only (nudges), so without this there is no way to measure
+	// after the fact how much of a run was spent in thinking-only stalls — the 空转率
+	// that task_outcome reports. Nil in tests that build steerHooks directly.
+	recordIdleTurn func()
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -614,6 +620,9 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 	if n > int64(h.limit) {
 		log.Printf("[work %s] 空转回合(仅思考、无正文无工具)已达续跑上限 %d，放行收场", h.label, h.limit)
 		return prevent, blocking, msg
+	}
+	if h.recordIdleTurn != nil {
+		h.recordIdleTurn()
 	}
 	log.Printf("[work %s] 空转回合(仅思考、无正文无工具)，注入续跑指令 (%d/%d)", h.label, n, h.limit)
 	return false, []string{emptyTurnNudge}, ""
@@ -755,6 +764,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	if _, loaded := e.started.LoadOrStore(t.ID, true); loaded {
 		e.deleteMu.RUnlock()
 		t.Notify() // already running — just nudge a planning round
+		// A revive lands here: the task's worker goroutines are still alive but were
+		// parked on a terminal status, so they must be woken to pick up new intents.
+		t.NotifyWorker()
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
@@ -774,6 +786,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	if has, _ := t.Store.HasActiveIntent(); !has {
 		t.Notify() // kick the first planning round (acted on once LLM is ready)
 	}
+	// Workers start their loops immediately, but a wake signal here also covers a task
+	// revived with intents already queued in the frontier.
+	t.NotifyWorker()
 }
 
 // plannerHeartbeatInterval 解析任务的 planner 心跳间隔。db.CreateTask 已归一
@@ -908,12 +923,47 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
 			runRound("heartbeat")
 		}
+		// A round is exactly when the planner may have pushed new intents into the
+		// frontier, so wake the pool: without this, workers would keep polling until
+		// their fallback tick to notice work that is already queued.
+		t.NotifyWorker()
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
 	}
 }
 
+// workerWakeFallback bounds how long an idle worker blocks before re-checking, as a
+// backstop for a wake signal that never arrived (NotifyWorker drops its signal when the
+// channel is full and the worker is not inside its select). Every real trigger — a
+// planner round that added intents, an intent settling, a resume, a revive, a provider
+// becoming ready — signals workerNotify directly, so this is a safety net rather than
+// the trigger. It is deliberately longer than the 800ms poll it replaces: that poll ran
+// a frontier query on every tick, while this only guards against a missed signal.
+const workerWakeFallback = 2 * time.Second
+
 func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
+	// One timer for the whole loop, re-armed per wait (time.After would allocate a fresh
+	// one every tick, per worker). Stop→drain→Reset is the pattern resetPlannerTimer
+	// already establishes above.
+	wake := time.NewTimer(workerWakeFallback)
+	defer wake.Stop()
+
+	// wait blocks until a wake signal arrives, the fallback elapses, or the task shuts
+	// down. It returns true when the loop must unwind. The timer is armed before the
+	// select, and the channel is buffered, so a signal that landed while this worker was
+	// busy is seen immediately instead of waiting out the fallback.
+	wait := func() (done bool) {
+		resetPlannerTimer(wake, workerWakeFallback)
+		select {
+		case <-ctx.Done():
+			return true
+		case <-t.workerNotify:
+			return false
+		case <-wake.C:
+			return false
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -922,13 +972,13 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 		}
 		_, worker := e.snapshotFor(t)
 		if worker == nil {
-			if sleepCtx(ctx, 1500*time.Millisecond) {
+			if wait() {
 				return
 			}
-			continue
+			continue // LLM not configured yet; a provider-ready signal wakes us
 		}
 		if e.IsPaused(t.ID) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+			if wait() {
 				return
 			}
 			continue // user-paused: don't claim/execute intents
@@ -937,13 +987,13 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			return
 		}
 		if e.isSettling(t.ID) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+			if wait() {
 				return
 			}
 			continue // 任务超时收尾中:不再领新意图(在跑的自行收尾,协调器等其 drain)
 		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+			if wait() {
 				return
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
@@ -953,7 +1003,7 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 		}
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
-		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
+		if !claimed && wait() {
 			return
 		}
 	}
@@ -1012,6 +1062,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
+		recordIdleTurn: func() {
+			nid := iid
+			e.emitActivity(t, db.Activity{
+				NodeID: &nid, Worker: name, Kind: "empty_turn",
+				Summary: "空转回合：模型只输出思考、无正文无工具调用，已注入续跑指令",
+			})
+		},
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
@@ -1125,6 +1182,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
 		t.Notify()
+		t.NotifyWorker() // this worker is about to free its slot
 		return true
 	}
 	if err != nil {
@@ -1153,6 +1211,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
+	t.NotifyWorker()        // finished: an idle worker should take the next intent without waiting out its fallback
 	return true
 }
 

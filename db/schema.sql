@@ -760,6 +760,56 @@ CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
 
+-- 每任务一行「跑完成什么样」的汇总，供效果度量（漏洞召回/误报、token 成本、空转率…）
+-- 做跨任务对比。由 server 的调度器在任务进入终态并静置后自动重算，没有人工重算入口。
+--
+-- 口径说明（同一任务用不同来源会得到不同数字，这里只选一个，列出来避免日后误读）：
+--   * token 一律取 llm_usage（按调用记账、成功失败都记、带 model/profile 维度，且任务
+--     冷归档后仍保留），而不是 activity 里 kind='result' 的每-run 汇总行。
+--   * duration_seconds = COALESCE(first_run_at, created_at) → completed_at：取「真正开始跑」
+--     到结束，把排队等待排除在外；first_run_at 为空（从未跑过）时退化为创建时间。
+--   * tool_calls 数的是 activity.kind='tool_use'，tool_errors 数的是 kind='tool_result'
+--     且 is_error 的行——分子分母不是同一批行，但比值仍表示「工具调用失败的密度」。
+--   * idle_turns 数的是 activity.kind='empty_turn'（engine 空转续跑埋点）。
+--   * findings_claimed 是本任务登记的全部漏洞（含未验证）；findings_confirmed 只数
+--     status='confirmed'。两者的差距就是「自报 vs 已验证」——飞轮最想看的信号之一。
+CREATE TABLE IF NOT EXISTS task_outcome (
+    task_id                 BIGINT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    exploration_id          BIGINT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT '',
+    completed_at            TIMESTAMPTZ,
+    computed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    llm_calls               BIGINT  NOT NULL DEFAULT 0,
+    input_tokens            BIGINT  NOT NULL DEFAULT 0,
+    output_tokens           BIGINT  NOT NULL DEFAULT 0,
+    cache_read_tokens       BIGINT  NOT NULL DEFAULT 0,
+    cache_write_tokens      BIGINT  NOT NULL DEFAULT 0,
+
+    goals_total             INTEGER NOT NULL DEFAULT 0,
+    goals_met               INTEGER NOT NULL DEFAULT 0,
+
+    findings_claimed        INTEGER NOT NULL DEFAULT 0,
+    findings_confirmed      INTEGER NOT NULL DEFAULT 0,
+    findings_false_positive INTEGER NOT NULL DEFAULT 0,
+    findings_critical       INTEGER NOT NULL DEFAULT 0,
+    findings_high           INTEGER NOT NULL DEFAULT 0,
+    findings_medium         INTEGER NOT NULL DEFAULT 0,
+    findings_low            INTEGER NOT NULL DEFAULT 0,
+
+    retests_fixed           INTEGER NOT NULL DEFAULT 0,
+
+    coverage_denominator    INTEGER NOT NULL DEFAULT 0,
+    coverage_tested         INTEGER NOT NULL DEFAULT 0,
+    coverage_pct            DOUBLE PRECISION,
+
+    duration_seconds        BIGINT  NOT NULL DEFAULT 0,
+    tool_calls              INTEGER NOT NULL DEFAULT 0,
+    tool_errors             INTEGER NOT NULL DEFAULT 0,
+    idle_turns              INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_task_outcome_completed ON task_outcome(completed_at DESC);
+
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录
 -- =====================================================================
@@ -1142,6 +1192,24 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+
+-- 独立验证记录：worker 自报的漏洞（findings.status='candidate'）经 verifier agent
+-- 用**与首次不同的路径/独立命令**复现后的结论。追加式日志——每完成一次验证写一行，
+-- 不设 pending/running 状态、也无需重启恢复（工作进行中的单位是会话，由调度器管）。
+-- 只有 verdict='confirmed' 会把 findings.status 提升为 confirmed；unverified /
+-- inconclusive 一律保持 candidate，系统从不自动断言「误报」（那是人工处置的语义）。
+CREATE TABLE IF NOT EXISTS finding_verifications (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    verdict TEXT NOT NULL CHECK (verdict IN ('confirmed','unverified','inconclusive')),
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    agent TEXT NOT NULL DEFAULT '',
+    conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_verifications_history ON finding_verifications(finding_id, id DESC);
+
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,

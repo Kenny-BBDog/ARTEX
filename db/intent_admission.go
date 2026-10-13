@@ -28,5 +28,9 @@ func (s *ExplorationStore) DiscardOpenIntent(id int64) error {
 	if removed != 1 {
 		return fmt.Errorf("open intent %d was not available for admission rollback", id)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.bumpGraph()
+	return nil
 }
