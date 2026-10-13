@@ -822,6 +822,20 @@ CREATE TABLE IF NOT EXISTS task_outcome (
     uncovered_agent_assets  INTEGER NOT NULL DEFAULT 0,
     uncovered_asset_list    JSONB   NOT NULL DEFAULT '[]'::jsonb,
 
+    -- 路线深度：每条路在被 worker 关掉之前究竟被推了多远。夹在「到没到得了」和「结论真不真」
+    -- 之间。系统没有「判死」这个状态——放弃的 worker 是【正常完成】的，所以浅尝辄止在所有
+    -- 其它度量里都读作健康。routes_thin / premature_exhaustion 只统计 done 的意图：exhausted
+    -- 是做得太多、blocked 是报错、stopped 是被外部杀，都不是 worker 自己对路线的判决。
+    -- premature_exhaustion = 没怎么动、零漏洞，却把结论标成 observed（自称手段已穷尽）。
+    routes_terminal         INTEGER NOT NULL DEFAULT 0,
+    routes_done             INTEGER NOT NULL DEFAULT 0,
+    routes_thin             INTEGER NOT NULL DEFAULT 0,
+    routes_yielding         INTEGER NOT NULL DEFAULT 0,
+    facts_inferred          INTEGER NOT NULL DEFAULT 0,
+    facts_observed          INTEGER NOT NULL DEFAULT 0,
+    premature_exhaustion    INTEGER NOT NULL DEFAULT 0,
+    thin_routes             JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
     duration_seconds        BIGINT  NOT NULL DEFAULT 0,
     tool_calls              INTEGER NOT NULL DEFAULT 0,
     tool_errors             INTEGER NOT NULL DEFAULT 0,
@@ -840,6 +854,16 @@ ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS linked_assets            INTEG
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_assets         INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_agent_assets   INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_asset_list     JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 路线深度（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_terminal        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_done            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_thin            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_yielding        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_inferred         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_observed         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS premature_exhaustion   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS thin_routes            JSONB   NOT NULL DEFAULT '[]'::jsonb;
 
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录

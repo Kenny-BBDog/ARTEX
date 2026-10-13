@@ -65,6 +65,19 @@ type TaskOutcome struct {
 	UncoveredAgentAssets int             `json:"uncovered_agent_assets"`
 	UncoveredAssetList   []ScopeGapAsset `json:"uncovered_asset_list"`
 
+	// Route depth: how hard each route was pushed before the worker closed it. The layer
+	// between "did we reach the surface" (above) and "was the claim true" (findings_*).
+	// See TaskDepth — in particular why RoutesThin/PrematureExhaustion are counted over
+	// `done` intents only.
+	RoutesTerminal      int          `json:"routes_terminal"`
+	RoutesDone          int          `json:"routes_done"`
+	RoutesThin          int          `json:"routes_thin"`
+	RoutesYielding      int          `json:"routes_yielding"`
+	FactsInferred       int          `json:"facts_inferred"`
+	FactsObserved       int          `json:"facts_observed"`
+	PrematureExhaustion int          `json:"premature_exhaustion"`
+	ThinRoutes          []DepthRoute `json:"thin_routes"`
+
 	DurationSeconds int64 `json:"duration_seconds"`
 	ToolCalls       int   `json:"tool_calls"`
 	ToolErrors      int   `json:"tool_errors"`
@@ -172,6 +185,15 @@ func (d *DB) ComputeTaskOutcome(ctx context.Context, taskID int64) (*TaskOutcome
 			o.UncoveredAssetList = sg.UncoveredAssets
 		}
 	}
+	if dp, err := d.Exploration(o.ExplorationID).TaskDepth(); err == nil && dp != nil {
+		o.RoutesTerminal, o.RoutesDone = dp.RoutesTerminal, dp.RoutesDone
+		o.RoutesThin, o.RoutesYielding = dp.RoutesThin, dp.RoutesYielding
+		o.FactsInferred, o.FactsObserved = dp.FactsInferred, dp.FactsObserved
+		o.PrematureExhaustion = dp.PrematureExhaustion
+		if dp.ThinRoutes != nil {
+			o.ThinRoutes = dp.ThinRoutes
+		}
+	}
 	return o, nil
 }
 
@@ -194,6 +216,10 @@ func (d *DB) UpsertTaskOutcome(ctx context.Context, o *TaskOutcome) error {
 	if err != nil || len(o.UncoveredAssetList) == 0 {
 		uncoveredJSON = []byte("[]")
 	}
+	thinJSON, err := json.Marshal(o.ThinRoutes)
+	if err != nil || len(o.ThinRoutes) == 0 {
+		thinJSON = []byte("[]")
+	}
 	_, err = d.ExecContext(ctx, `
 INSERT INTO task_outcome(
     task_id, exploration_id, status, completed_at, computed_at,
@@ -204,9 +230,12 @@ INSERT INTO task_outcome(
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
     claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
     linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
+    routes_terminal, routes_done, routes_thin, routes_yielding,
+    facts_inferred, facts_observed, premature_exhaustion, thin_routes,
     duration_seconds, tool_calls, tool_errors, idle_turns)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
-        $24,$25,$26,$27::jsonb,$28,$29,$30,$31::jsonb,$32,$33,$34,$35)
+        $24,$25,$26,$27::jsonb,$28,$29,$30,$31::jsonb,
+        $32,$33,$34,$35,$36,$37,$38,$39::jsonb,$40,$41,$42,$43)
 ON CONFLICT (task_id) DO UPDATE SET
     exploration_id = EXCLUDED.exploration_id, status = EXCLUDED.status,
     completed_at = EXCLUDED.completed_at, computed_at = EXCLUDED.computed_at,
@@ -227,6 +256,10 @@ ON CONFLICT (task_id) DO UPDATE SET
     linked_assets = EXCLUDED.linked_assets, uncovered_assets = EXCLUDED.uncovered_assets,
     uncovered_agent_assets = EXCLUDED.uncovered_agent_assets,
     uncovered_asset_list = EXCLUDED.uncovered_asset_list,
+    routes_terminal = EXCLUDED.routes_terminal, routes_done = EXCLUDED.routes_done,
+    routes_thin = EXCLUDED.routes_thin, routes_yielding = EXCLUDED.routes_yielding,
+    facts_inferred = EXCLUDED.facts_inferred, facts_observed = EXCLUDED.facts_observed,
+    premature_exhaustion = EXCLUDED.premature_exhaustion, thin_routes = EXCLUDED.thin_routes,
     duration_seconds = EXCLUDED.duration_seconds, tool_calls = EXCLUDED.tool_calls,
     tool_errors = EXCLUDED.tool_errors, idle_turns = EXCLUDED.idle_turns`,
 		o.TaskID, o.ExplorationID, o.Status, o.CompletedAt, o.ComputedAt,
@@ -237,6 +270,8 @@ ON CONFLICT (task_id) DO UPDATE SET
 		o.RetestsFixed, o.CoverageDenominator, o.CoverageTested, o.CoveragePct,
 		o.ClaimedAssets, o.ClaimedConfirmedAssets, o.SilentAssets, string(silentJSON),
 		o.LinkedAssets, o.UncoveredAssets, o.UncoveredAgentAssets, string(uncoveredJSON),
+		o.RoutesTerminal, o.RoutesDone, o.RoutesThin, o.RoutesYielding,
+		o.FactsInferred, o.FactsObserved, o.PrematureExhaustion, string(thinJSON),
 		o.DurationSeconds, o.ToolCalls, o.ToolErrors, o.IdleTurns)
 	return err
 }
@@ -249,6 +284,8 @@ const outcomeCols = `task_id, exploration_id, status, completed_at, computed_at,
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
     claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
     linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
+    routes_terminal, routes_done, routes_thin, routes_yielding,
+    facts_inferred, facts_observed, premature_exhaustion, thin_routes,
     duration_seconds, tool_calls, tool_errors, idle_turns`
 
 func scanOutcome(rows interface {
@@ -260,7 +297,7 @@ func scanOutcome(rows interface {
 	for rows.Next() {
 		o := &TaskOutcome{}
 		var completed sql.NullTime
-		var silentJSON, uncoveredJSON []byte
+		var silentJSON, uncoveredJSON, thinJSON []byte
 		if err := rows.Scan(
 			&o.TaskID, &o.ExplorationID, &o.Status, &completed, &o.ComputedAt,
 			&o.LLMCalls, &o.InputTokens, &o.OutputTokens, &o.CacheReadTokens, &o.CacheWriteTokens,
@@ -270,6 +307,8 @@ func scanOutcome(rows interface {
 			&o.RetestsFixed, &o.CoverageDenominator, &o.CoverageTested, &o.CoveragePct,
 			&o.ClaimedAssets, &o.ClaimedConfirmedAssets, &o.SilentAssets, &silentJSON,
 			&o.LinkedAssets, &o.UncoveredAssets, &o.UncoveredAgentAssets, &uncoveredJSON,
+			&o.RoutesTerminal, &o.RoutesDone, &o.RoutesThin, &o.RoutesYielding,
+			&o.FactsInferred, &o.FactsObserved, &o.PrematureExhaustion, &thinJSON,
 			&o.DurationSeconds, &o.ToolCalls, &o.ToolErrors, &o.IdleTurns,
 		); err != nil {
 			return nil, err
@@ -285,6 +324,9 @@ func scanOutcome(rows interface {
 		}
 		if len(uncoveredJSON) > 0 {
 			_ = json.Unmarshal(uncoveredJSON, &o.UncoveredAssetList)
+		}
+		if len(thinJSON) > 0 {
+			_ = json.Unmarshal(thinJSON, &o.ThinRoutes)
 		}
 		out = append(out, o)
 	}

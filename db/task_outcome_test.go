@@ -33,6 +33,10 @@ var claimSilentAssetID int64
 // leaves outside the scope predicate.
 var gapAssetID int64
 
+// thinIntentID is set by outcomeFixture to the barely-touched route it creates, so the
+// thin_routes JSONB round-trip assertion can name it exactly.
+var thinIntentID int64
+
 // outcomeFixture builds one terminal task with data in every table the outcome
 // aggregation reads, so a single assertion can cover the whole metric surface.
 func outcomeFixture(t *testing.T) (*DB, *Task) {
@@ -142,6 +146,25 @@ VALUES ($1,'completed','fixed','{}')`, f1); err != nil {
 		t.Fatal(err)
 	}
 
+	// 路线深度：一条只动了一下、零漏洞、却把结论标成 observed 的路线 —— premature_exhaustion
+	// 的那一格。它同时让 thin_routes 的 JSONB 往返有真实内容可测。
+	thinIntent, err := expStore.AddNode(KindIntent, map[string]any{"summary": "thin route"}, 0, "done", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO activity(exploration_id, node_id, kind) VALUES ($1,$2,'tool_use')`,
+		exp, thinIntent); err != nil {
+		t.Fatal(err)
+	}
+	thinFact, err := expStore.AddNode(KindFact, map[string]any{"summary": "not injectable", "confidence": "observed"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := expStore.Link(thinIntent, RelYields, thinFact); err != nil {
+		t.Fatal(err)
+	}
+	thinIntentID = thinIntent
+
 	// 终态 + 首跑时间（duration 从 first_run_at 起算）。
 	back := time.Now().Add(-3 * time.Hour)
 	if _, err := d.Exec(`UPDATE tasks SET first_run_at=$1 WHERE id=$2`, back, task.ID); err != nil {
@@ -184,8 +207,9 @@ func TestComputeAndStoreTaskOutcome(t *testing.T) {
 	if o.RetestsFixed != 1 {
 		t.Fatalf("retests_fixed = %d, want 1", o.RetestsFixed)
 	}
-	if o.ToolCalls != 2 || o.ToolErrors != 1 {
-		t.Fatalf("tool calls=%d errors=%d, want 2/1", o.ToolCalls, o.ToolErrors)
+	// 3 = the two seeded tool_use rows plus the one the thin route in this fixture ran.
+	if o.ToolCalls != 3 || o.ToolErrors != 1 {
+		t.Fatalf("tool calls=%d errors=%d, want 3/1", o.ToolCalls, o.ToolErrors)
 	}
 	if o.IdleTurns != 3 {
 		t.Fatalf("idle_turns = %d, want 3", o.IdleTurns)
@@ -224,6 +248,21 @@ func TestComputeAndStoreTaskOutcome(t *testing.T) {
 	if o.UncoveredAssetList[0].Source != "agent" {
 		t.Fatalf("gap asset source = %q, want agent (the provenance that makes the gap actionable)",
 			o.UncoveredAssetList[0].Source)
+	}
+
+	// Route depth rides on the same row, and its JSONB list must survive the round-trip.
+	if o.RoutesTerminal != 1 || o.RoutesDone != 1 || o.RoutesThin != 1 {
+		t.Fatalf("routes terminal=%d done=%d thin=%d, want 1/1/1",
+			o.RoutesTerminal, o.RoutesDone, o.RoutesThin)
+	}
+	if o.FactsObserved != 1 || o.FactsInferred != 0 {
+		t.Fatalf("facts observed=%d inferred=%d, want 1/0", o.FactsObserved, o.FactsInferred)
+	}
+	if o.PrematureExhaustion != 1 {
+		t.Fatalf("premature_exhaustion = %d, want 1", o.PrematureExhaustion)
+	}
+	if len(o.ThinRoutes) != 1 || o.ThinRoutes[0].IntentID != thinIntentID {
+		t.Fatalf("thin_routes = %+v, want the one thin route id=%d", o.ThinRoutes, thinIntentID)
 	}
 
 	if err := d.UpsertTaskOutcome(ctx, o); err != nil {
