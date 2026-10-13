@@ -821,6 +821,21 @@ WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, l
 	return scanNodes(rows)
 }
 
+// IntentYieldCount reports how many nodes this intent produced (intent --yields--> X).
+//
+// This is the check behind forced write-back. The exploration graph is the only place a
+// finished route leaves anything behind, and an intent that ends having yielded nothing
+// is a hole in it: the planner sees `{state: exhausted}` with no content attached and
+// cannot tell "tried it, dead end" from "ran out of turns, worth another angle" from
+// "died on a provider error, nobody knows". Those three call for different next moves,
+// so the difference has to live in the graph rather than in the reader's imagination.
+func (s *ExplorationStore) IntentYieldCount(intentID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT count(*) FROM exploration_edges
+WHERE exploration_id = $1 AND src_id = $2 AND rel = $3`, s.expID, intentID, RelYields).Scan(&n)
+	return n, err
+}
+
 // ListByKindPage returns one newest-first page of nodes of a kind for reverse
 // pagination: up to `limit` nodes with id < `before` (before<=0 = the newest page).
 // hasMore reports whether still-older nodes exist, so a client (e.g. the worker
