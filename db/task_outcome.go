@@ -367,15 +367,23 @@ LIMIT $2`, status, limit)
 	return scanOutcome(rows)
 }
 
-// TasksNeedingOutcome lists terminal tasks whose outcome is missing or stale, i.e. it was
-// computed before the task finished. Only tasks that have been terminal for at least the
-// grace period qualify.
+// TasksNeedingOutcome lists terminal tasks whose outcome is missing or stale. Only tasks
+// that have been terminal for at least the grace period qualify.
 //
 // The grace period matters: a task is marked done BEFORE its running workers are
 // cancelled (server/engine.go, planner's all-goals-met branch), so they keep writing for
 // a short while after. Computing immediately would systematically undercount. Waiting
 // also makes this self-healing across restarts — a task that finished while the server
 // was down is picked up on the next pass.
+//
+// Staleness is NOT just "computed before the task finished". Adjudication lands late and
+// asynchronously: the verifier is a separate agent woken by a tool_call trigger, so a
+// verification can be written well after the worker that reported the finding has exited
+// — observed 15s after the first sweep had already stored the row. A task's outcome is
+// therefore also stale when any adjudication row is newer than it, and re-selecting on
+// that is what keeps the confirmed count from freezing below the truth forever. This
+// converges: each verification is written once, so once computed_at is past the newest
+// one the task stops being selected.
 func (d *DB) TasksNeedingOutcome(grace time.Duration, limit int) ([]int64, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -389,7 +397,13 @@ WHERE task.deleted_at IS NULL
   AND task.status IN ('done','failed','timeout')
   AND task.completed_at IS NOT NULL
   AND task.completed_at < $1
-  AND (o.task_id IS NULL OR o.computed_at < task.completed_at)
+  AND (o.task_id IS NULL OR o.computed_at < GREATEST(
+        task.completed_at,
+        COALESCE((SELECT max(v.created_at) FROM finding_verifications v
+                  JOIN findings f ON f.id = v.finding_id WHERE f.task_id = task.id), 'epoch'::timestamptz),
+        COALESCE((SELECT max(r.created_at) FROM finding_retests r
+                  JOIN findings f2 ON f2.id = r.finding_id WHERE f2.task_id = task.id), 'epoch'::timestamptz)
+      ))
 ORDER BY task.completed_at
 LIMIT $2`, cutoff, limit)
 	if err != nil {

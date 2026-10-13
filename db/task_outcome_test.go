@@ -346,6 +346,52 @@ func TestTasksNeedingOutcomeRespectsGraceAndFreshness(t *testing.T) {
 	}
 }
 
+// TestTasksNeedingOutcomeRecomputesWhenAdjudicationLandsLate is the regression test for a
+// staleness bug the T2 end-to-end run exposed: the outcome was computed 32s after the task
+// finished, and the last verification landed 15s after that — so the row said
+// confirmed=3 while the truth was 4, permanently, because the sweep only re-selected tasks
+// whose computed_at predated completed_at. Verifier agents are triggered asynchronously,
+// so adjudication routinely outlives the worker that reported the finding.
+func TestTasksNeedingOutcomeRecomputesWhenAdjudicationLandsLate(t *testing.T) {
+	d, task := outcomeFixture(t)
+	ctx := context.Background()
+
+	// A verification written now, with the outcome stamped as computed a minute ago.
+	if _, err := d.Exec(`
+INSERT INTO finding_verifications(finding_id, verdict, summary, evidence, agent, created_at)
+SELECT id, 'confirmed', 'late', 'late', 'verifier', now() FROM findings WHERE task_id=$1 LIMIT 1`,
+		task.ID); err != nil {
+		t.Fatal(err)
+	}
+	o, err := d.ComputeTaskOutcome(ctx, task.ID)
+	if err != nil || o == nil {
+		t.Fatalf("compute: %+v err=%v", o, err)
+	}
+	o.ComputedAt = time.Now().Add(-time.Minute)
+	if err := d.UpsertTaskOutcome(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := d.TasksNeedingOutcome(0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsID(ids, task.ID) {
+		t.Fatal("an outcome older than a later verification was not re-selected — " +
+			"the confirmed count would freeze below the truth forever")
+	}
+
+	// Once computed past the newest adjudication write, it must settle.
+	o.ComputedAt = time.Now().Add(time.Minute)
+	if err := d.UpsertTaskOutcome(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ = d.TasksNeedingOutcome(0, 50)
+	if containsID(ids, task.ID) {
+		t.Fatal("a settled outcome was re-selected — the sweep would never converge")
+	}
+}
+
 func TestListTaskOutcomesFiltersByStatus(t *testing.T) {
 	d, task := outcomeFixture(t)
 	ctx := context.Background()
