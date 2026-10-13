@@ -152,6 +152,9 @@ func (sc *Scheduler) refreshOutcomes(ctx context.Context) {
 		if err := sc.pg.UpsertTaskOutcome(ctx, o); err != nil {
 			log.Printf("[outcome] task %d 落库失败: %v", id, err)
 		}
+		// 共享大脑的写入侧：把本任务 observed 级结论提炼进全局经验库（幂等，
+		// 同名跳过）。放在 outcome 落定之后 —— 只有确认任务真的结束才提炼。
+		sc.deriveLessons(id, sc.s.m.dir)
 	}
 }
 

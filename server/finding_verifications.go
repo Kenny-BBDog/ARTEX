@@ -124,6 +124,8 @@ func truncateRunes(s string, n int) string {
 // TestHostToolsCoverVerifierBindings enforces that.
 var verifierBoundTools = []string{
 	"list_candidate_findings", "record_finding_verification",
+	// 共享经验的「不同的声音」：比对新观察与既有经验，否证时删条目。
+	"list_lessons", "quash_lesson",
 	"get_task_node_detail", "list_task_findings",
 	"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
 	"get_task_graph",
@@ -148,6 +150,15 @@ func (s *Server) seedVerifierAgent() {
 		bindings, _ := json.Marshal([]string{db.VerifierAgentKey})
 		if err := s.m.pg.SeedTool(t.Name(), t.Description(), schema, bindings); err != nil {
 			log.Printf("[verifier] 注册工具 %s 失败: %v", t.Name(), err)
+			return
+		}
+	}
+	// 经验库的「不同的声音」工具（见 lesson_verify.go）。
+	for _, t := range s.lessonConflictTools() {
+		schema, _ := json.Marshal(t.InputSchema())
+		bindings, _ := json.Marshal([]string{db.VerifierAgentKey})
+		if err := s.m.pg.SeedTool(t.Name(), t.Description(), schema, bindings); err != nil {
+			log.Printf("[verifier] 注册经验工具 %s 失败: %v", t.Name(), err)
 			return
 		}
 	}
@@ -182,7 +193,19 @@ func (s *Server) seedVerifierAgent() {
 	}); err != nil {
 		log.Printf("[verifier] 创建触发器失败: %v", err)
 	}
-	log.Printf("[verifier] 已预置「漏洞验证」agent + finding 触发器")
+	// 经验矛盾触发器：observed fact 落图时唤醒 verifier 比对经验库（不同的声音）。
+	// 只对 observed 级触发——inferred 是猜想，拿猜想否证经验是让噪音开门。
+	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
+		AgentKey:   db.VerifierAgentKey,
+		Enabled:    true,
+		OnToolCall: true,
+		ToolNames:  []string{"record_fact"},
+		ToolCallMessage: lessonConflictMessage("（见下方触发原文中的 record_fact 调用参数）") +
+			"——读取最近一次 record_fact 的 summary 与 confidence，仅 confidence=observed 时比对；inferred 的直接忽略本轮。",
+	}); err != nil {
+		log.Printf("[verifier] 创建经验触发器失败: %v", err)
+	}
+	log.Printf("[verifier] 已预置「漏洞验证」agent + finding/经验两个触发器")
 }
 
 // listFindingVerifications exposes the audit trail: what was verified, by whom, and

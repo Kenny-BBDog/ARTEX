@@ -439,6 +439,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		// 共享大脑：跨任务经验按相关性强制注入本轮输入（≤3 条，照 memoryInject 注释）。
+		// planner 的输入是态势文本，Relevant() 天然按当前态势过滤过期经验。
+		Memory: memoryInject(p.workDir),
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
