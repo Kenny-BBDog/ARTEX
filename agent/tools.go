@@ -1214,10 +1214,20 @@ func (t *ToolSet) requireVerifiedFinding(nodeID int64) error {
 // 1 of those 41 assets. Declaring done was the path of least resistance and it looked
 // exactly like success.
 //
-// Escape hatches, both deliberate:
+// The gate fires only on an EGREGIOUS early exit — most of the budget still unspent — and
+// the threshold is load-bearing, not cosmetic. Run against OWASP Juice Shop, the
+// unconditional version of this gate made the run spend 60% more compute (413 → 682 LLM
+// calls) for no additional recall at all (29 vs 27, inside run-to-run noise), because
+// "do not stop yet" reads as "keep working the surface you are on" rather than "go find
+// the surface you have not touched". Refusing a wrap-up is worth doing when the run is
+// plainly leaving the table early; making it grind out the last budget is not.
+//
+// Escape hatches, all deliberate:
 //   - a recorded waiver (accept_untested_surface): the planner may absolutely decide the
 //     remainder is not worth pursuing. The goal is to force the decision, not the coverage.
-//   - budget exhausted: out of room is a legitimate ending, not a premature one.
+//   - most of the budget already spent: past this point "stopping" and "running out" are
+//     the same thing, and holding the task open only bills for the remainder.
+//   - no time budget at all: without one there is no "early" to detect.
 func (t *ToolSet) requireSurfaceReviewed() error {
 	if t.ts == nil {
 		return nil
@@ -1229,8 +1239,8 @@ func (t *ToolSet) requireSurfaceReviewed() error {
 	if err != nil || us == nil || us.Untouched == 0 {
 		return nil
 	}
-	if us.BudgetLeftPct != nil && *us.BudgetLeftPct <= 0 {
-		return nil // out of budget; the run cannot do more
+	if us.BudgetLeftPct == nil || *us.BudgetLeftPct <= earlyExitBudgetLeft {
+		return nil
 	}
 	sample := ""
 	for i, a := range us.Sample {
@@ -1250,6 +1260,10 @@ func (t *ToolSet) requireSurfaceReviewed() error {
 		"调 accept_untested_surface 说明理由后再 prove_goal。%s",
 		us.Untouched, budget, sample)
 }
+
+// earlyExitBudgetLeft is the unspent budget share above which a wrap-up counts as an
+// egregious early exit. Half is the line where "I am done" stops being plausible.
+const earlyExitBudgetLeft = 0.5
 
 // acceptUntestedSurface records the planner's explicit decision to leave the remaining
 // discovered-but-untouched assets alone. See requireSurfaceReviewed.

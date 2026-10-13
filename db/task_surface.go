@@ -15,8 +15,14 @@ import "database/sql"
 //
 // So this view is keyed on the task's OWN ownership (task_asset_links), not on scope:
 // assets this run discovered and took ownership of, and then never worked on at all.
+//
+// Untouched counts only assets that are ALSO not claimed by a live (open/running) intent,
+// so it answers the gate's question — "is anything being left unattended right now?" — and
+// not the outcome row's — "of what we discovered, how much did we ever actually work on?".
+// Those are different moments: at outcome time the run is over and nothing is in flight,
+// so the two figures legitimately differ.
 type UntouchedSurface struct {
-	Untouched     int             `json:"untouched"`      // 已发现但从未触碰的资产数
+	Untouched     int             `json:"untouched"`      // 已发现、从未触碰、且没有在飞意图认领的资产数
 	Sample        []CoverageAsset `json:"sample"`         // 上述资产样本（最多 limit 条）
 	BudgetSeconds int64           `json:"budget_seconds"` // 任务时间预算；0=不限
 	// BudgetLeftPct is the unspent share of the budget; nil when unlimited.
@@ -32,6 +38,23 @@ const touchedCTE = `touched AS (
   FROM exploration_anchors ea
   JOIN exploration_nodes n ON n.id = ea.node_id
   WHERE n.exploration_id = $1 AND n.kind IN ('fact','finding')
+)`
+
+// claimedCTE is the alignment fix. The planner de-duplicates by INTENT, and add_intent
+// anchors the assets a direction is aimed at — so an asset under an open or running intent
+// is already spoken for in the planner's head. The asset-level metric knew nothing about
+// that, so the two disagreed, and the disagreement was not free: on the Juice Shop re-run
+// the wrap-up gate fired three times over 13 assets the planner had explicitly described
+// as "already covered by open intents", and the run burned the remainder of its budget
+// re-chewing the same surface for no additional recall.
+//
+// An asset that a live intent is aimed at is NOT unattended. It is in flight. Only an
+// asset that nobody has worked on and nobody is heading for is genuinely left on the table.
+const claimedCTE = `claimed AS (
+  SELECT DISTINCT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes n ON n.id = ea.node_id
+  WHERE n.exploration_id = $1 AND n.kind = 'intent' AND n.state IN ('open','running')
 )`
 
 // UntouchedSurface returns the discovery-vs-work gap for this exploration's task. The
@@ -50,11 +73,13 @@ WITH task AS (
   FROM tasks WHERE exploration_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1
 ),
 linked AS (SELECT l.asset_id FROM task_asset_links l JOIN task t ON t.id = l.task_id),
-`+touchedCTE+`
+`+touchedCTE+`,
+`+claimedCTE+`
 SELECT COALESCE((SELECT budget FROM task), 0),
        COALESCE((SELECT EXTRACT(EPOCH FROM (end_at - start_at))::bigint FROM task), 0),
        (SELECT count(*) FROM linked l
-         WHERE NOT EXISTS (SELECT 1 FROM touched t WHERE t.asset_id = l.asset_id))`,
+         WHERE NOT EXISTS (SELECT 1 FROM touched t WHERE t.asset_id = l.asset_id)
+           AND NOT EXISTS (SELECT 1 FROM claimed c WHERE c.asset_id = l.asset_id))`,
 		s.expID).Scan(&out.BudgetSeconds, &usedSeconds, &out.Untouched)
 	if err != nil {
 		return nil, err
@@ -77,11 +102,13 @@ WITH task AS (
   SELECT id FROM tasks WHERE exploration_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1
 ),
 linked AS (SELECT l.asset_id FROM task_asset_links l JOIN task t ON t.id = l.task_id),
-`+touchedCTE+`
+`+touchedCTE+`,
+`+claimedCTE+`
 SELECT a.id, a.type, COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '')
 FROM linked l
 JOIN assets a ON a.id = l.asset_id
 WHERE NOT EXISTS (SELECT 1 FROM touched t WHERE t.asset_id = l.asset_id)
+  AND NOT EXISTS (SELECT 1 FROM claimed c WHERE c.asset_id = l.asset_id)
 ORDER BY a.id LIMIT $2`, s.expID, limit)
 	if err != nil {
 		return nil, err
