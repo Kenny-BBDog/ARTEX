@@ -78,6 +78,15 @@ type TaskOutcome struct {
 	PrematureExhaustion int          `json:"premature_exhaustion"`
 	ThinRoutes          []DepthRoute `json:"thin_routes"`
 
+	// Breadth within budget: whether the run stopped because the work was done or because
+	// it stopped looking. LateReachGrowth near zero means the second half opened up no new
+	// surface — however busy the run looked. See TaskBreadth.
+	BudgetSeconds   int64    `json:"budget_seconds"`
+	BudgetLeftPct   *float64 `json:"budget_left_pct"`
+	AssetsReached   int      `json:"assets_reached"`
+	ReachAtMidpoint int      `json:"reach_at_midpoint"`
+	LateReachGrowth int      `json:"late_reach_growth"`
+
 	DurationSeconds int64 `json:"duration_seconds"`
 	ToolCalls       int   `json:"tool_calls"`
 	ToolErrors      int   `json:"tool_errors"`
@@ -194,6 +203,11 @@ func (d *DB) ComputeTaskOutcome(ctx context.Context, taskID int64) (*TaskOutcome
 			o.ThinRoutes = dp.ThinRoutes
 		}
 	}
+	if br, err := d.Assets().TaskBreadth(taskID, o.ExplorationID); err == nil && br != nil {
+		o.BudgetSeconds, o.BudgetLeftPct = br.BudgetSeconds, br.BudgetLeftPct
+		o.AssetsReached = br.AssetsReached
+		o.ReachAtMidpoint, o.LateReachGrowth = br.ReachAtMidpoint, br.LateReachGrowth
+	}
 	return o, nil
 }
 
@@ -232,10 +246,12 @@ INSERT INTO task_outcome(
     linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
     routes_terminal, routes_done, routes_thin, routes_yielding,
     facts_inferred, facts_observed, premature_exhaustion, thin_routes,
+    budget_seconds, budget_left_pct, assets_reached, reach_at_midpoint, late_reach_growth,
     duration_seconds, tool_calls, tool_errors, idle_turns)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
         $24,$25,$26,$27::jsonb,$28,$29,$30,$31::jsonb,
-        $32,$33,$34,$35,$36,$37,$38,$39::jsonb,$40,$41,$42,$43)
+        $32,$33,$34,$35,$36,$37,$38,$39::jsonb,
+        $40,$41,$42,$43,$44,$45,$46,$47,$48)
 ON CONFLICT (task_id) DO UPDATE SET
     exploration_id = EXCLUDED.exploration_id, status = EXCLUDED.status,
     completed_at = EXCLUDED.completed_at, computed_at = EXCLUDED.computed_at,
@@ -260,6 +276,9 @@ ON CONFLICT (task_id) DO UPDATE SET
     routes_thin = EXCLUDED.routes_thin, routes_yielding = EXCLUDED.routes_yielding,
     facts_inferred = EXCLUDED.facts_inferred, facts_observed = EXCLUDED.facts_observed,
     premature_exhaustion = EXCLUDED.premature_exhaustion, thin_routes = EXCLUDED.thin_routes,
+    budget_seconds = EXCLUDED.budget_seconds, budget_left_pct = EXCLUDED.budget_left_pct,
+    assets_reached = EXCLUDED.assets_reached,
+    reach_at_midpoint = EXCLUDED.reach_at_midpoint, late_reach_growth = EXCLUDED.late_reach_growth,
     duration_seconds = EXCLUDED.duration_seconds, tool_calls = EXCLUDED.tool_calls,
     tool_errors = EXCLUDED.tool_errors, idle_turns = EXCLUDED.idle_turns`,
 		o.TaskID, o.ExplorationID, o.Status, o.CompletedAt, o.ComputedAt,
@@ -272,6 +291,7 @@ ON CONFLICT (task_id) DO UPDATE SET
 		o.LinkedAssets, o.UncoveredAssets, o.UncoveredAgentAssets, string(uncoveredJSON),
 		o.RoutesTerminal, o.RoutesDone, o.RoutesThin, o.RoutesYielding,
 		o.FactsInferred, o.FactsObserved, o.PrematureExhaustion, string(thinJSON),
+		o.BudgetSeconds, o.BudgetLeftPct, o.AssetsReached, o.ReachAtMidpoint, o.LateReachGrowth,
 		o.DurationSeconds, o.ToolCalls, o.ToolErrors, o.IdleTurns)
 	return err
 }
@@ -286,6 +306,7 @@ const outcomeCols = `task_id, exploration_id, status, completed_at, computed_at,
     linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
     routes_terminal, routes_done, routes_thin, routes_yielding,
     facts_inferred, facts_observed, premature_exhaustion, thin_routes,
+    budget_seconds, budget_left_pct, assets_reached, reach_at_midpoint, late_reach_growth,
     duration_seconds, tool_calls, tool_errors, idle_turns`
 
 func scanOutcome(rows interface {
@@ -309,6 +330,8 @@ func scanOutcome(rows interface {
 			&o.LinkedAssets, &o.UncoveredAssets, &o.UncoveredAgentAssets, &uncoveredJSON,
 			&o.RoutesTerminal, &o.RoutesDone, &o.RoutesThin, &o.RoutesYielding,
 			&o.FactsInferred, &o.FactsObserved, &o.PrematureExhaustion, &thinJSON,
+			&o.BudgetSeconds, &o.BudgetLeftPct, &o.AssetsReached,
+			&o.ReachAtMidpoint, &o.LateReachGrowth,
 			&o.DurationSeconds, &o.ToolCalls, &o.ToolErrors, &o.IdleTurns,
 		); err != nil {
 			return nil, err

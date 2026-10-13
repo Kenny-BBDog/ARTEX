@@ -449,6 +449,91 @@ type ScopeGap struct {
 	UncoveredAssets []ScopeGapAsset `json:"uncovered_assets"` // 上述资产的样本（最多 listLimit 条）
 }
 
+// TaskBreadth measures how a run spent its budget across the attack surface — the other
+// half of "why didn't we find it".
+//
+// The reach/claim/depth metrics all describe *what* was covered. None of them says whether
+// the run stopped because the work was done or because it stopped looking. A run can end
+// with surface untouched and budget in hand: that is the agent declaring itself finished
+// early, and on a real application — hundreds of endpoints with a handful of bugs hiding
+// among them — that is a likelier way to lose recall than giving up inside any one route.
+//
+// LateReachGrowth is the discriminating number. It is how much new surface the second half
+// of the run opened up. Near zero means the run converged onto a corner of the target and
+// stayed there, however busy it looked; paired with budget_left_pct and the uncovered count
+// it separates "ran out of room" from "chose to stop".
+type TaskBreadth struct {
+	BudgetSeconds int64 `json:"budget_seconds"` // 任务时间预算；0=不限
+	// BudgetLeftPct is the share of the budget left when the run ended. nil when unlimited
+	// — "left over" is meaningless without a denominator.
+	BudgetLeftPct *float64 `json:"budget_left_pct"`
+	// ReachAtMidpoint / LateReachGrowth split AssetsReached at the run's time midpoint.
+	AssetsReached   int `json:"assets_reached"`    // 到过的已发现资产数
+	ReachAtMidpoint int `json:"reach_at_midpoint"` // 前半程新铺开的
+	LateReachGrowth int `json:"late_reach_growth"` // 后半程新增；ReachAtMidpoint+LateReachGrowth == AssetsReached
+}
+
+// TaskBreadth computes the breadth figures for one task.
+//
+// The universe is the assets the task has OWNED (task_asset_links), not the scope-matched
+// denominator Coverage uses. That distinction is deliberate: "did we stop looking while
+// there was still surface" is a question about the surface the agent itself had already
+// found, and every one of those assets was fair game to explore further. Dividing by the
+// authorization denominator instead would make the figure move whenever scope bookkeeping
+// drifted — which it demonstrably does (see TaskScopeGap) — and would understate breadth
+// on exactly the runs that discovered the most.
+//
+// Reached assets are identified by their FIRST anchor time, so re-touching an asset later
+// does not count as new breadth.
+func (s *AssetStore) TaskBreadth(taskID, expID int64) (*TaskBreadth, error) {
+	out := &TaskBreadth{}
+	var usedSeconds int64
+	err := s.db.QueryRow(`
+WITH linked AS (
+  SELECT asset_id FROM task_asset_links WHERE task_id = $1
+),
+reached_at AS (
+  SELECT ea.asset_id, min(n.created_at) AS first_at
+  FROM exploration_anchors ea
+  JOIN exploration_nodes n ON n.id = ea.node_id
+  WHERE n.exploration_id = $2 AND n.kind = 'fact'
+  GROUP BY ea.asset_id
+),
+bounds AS (
+  SELECT COALESCE(first_run_at, created_at) AS start_at,
+         COALESCE(completed_at, now())      AS end_at,
+         COALESCE(timeout_seconds, 0)       AS budget
+  FROM tasks WHERE id = $1
+)
+SELECT b.budget,
+       -- Scan order is (budget, midpoint, total, used): keep the SELECT in that order so a
+       -- reordering here cannot silently swap two same-typed counts.
+       (SELECT count(*) FROM linked l JOIN reached_at r ON r.asset_id = l.asset_id
+         WHERE r.first_at <= b.start_at + (b.end_at - b.start_at) / 2),
+       (SELECT count(*) FROM linked l JOIN reached_at r ON r.asset_id = l.asset_id),
+       GREATEST(EXTRACT(EPOCH FROM (b.end_at - b.start_at))::bigint, 0)
+FROM bounds b`, taskID, expID).Scan(&out.BudgetSeconds, &out.ReachAtMidpoint, &out.LateReachGrowth, &usedSeconds)
+	if err != nil {
+		return nil, err
+	}
+	// Computed as a difference so ReachAtMidpoint + LateReachGrowth == Reached by
+	// construction. Reached is also AssetsReached on the struct — the linked-but-untouched
+	// remainder is the gap between LinkedAssets and this figure on the same outcome row.
+	out.LateReachGrowth -= out.ReachAtMidpoint
+	out.AssetsReached = out.ReachAtMidpoint + out.LateReachGrowth
+	if out.BudgetSeconds > 0 {
+		left := float64(out.BudgetSeconds-usedSeconds) / float64(out.BudgetSeconds)
+		if left < 0 {
+			left = 0
+		}
+		if left > 1 {
+			left = 1
+		}
+		out.BudgetLeftPct = &left
+	}
+	return out, nil
+}
+
 // TaskScopeGap computes the linked-but-unscoped gap for one task. listLimit caps the
 // sample (<=0 → 20); Uncovered is the true count regardless.
 //

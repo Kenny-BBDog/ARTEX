@@ -165,9 +165,9 @@ VALUES ($1,'completed','fixed','{}')`, f1); err != nil {
 	}
 	thinIntentID = thinIntent
 
-	// 终态 + 首跑时间（duration 从 first_run_at 起算）。
+	// 终态 + 首跑时间（duration 从 first_run_at 起算）+ 时间预算（广度度量要用）。
 	back := time.Now().Add(-3 * time.Hour)
-	if _, err := d.Exec(`UPDATE tasks SET first_run_at=$1 WHERE id=$2`, back, task.ID); err != nil {
+	if _, err := d.Exec(`UPDATE tasks SET first_run_at=$1, timeout_seconds=600 WHERE id=$2`, back, task.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.SetStatus(task.ID, "done"); err != nil {
@@ -263,6 +263,24 @@ func TestComputeAndStoreTaskOutcome(t *testing.T) {
 	}
 	if len(o.ThinRoutes) != 1 || o.ThinRoutes[0].IntentID != thinIntentID {
 		t.Fatalf("thin_routes = %+v, want the one thin route id=%d", o.ThinRoutes, thinIntentID)
+	}
+
+	// Breadth: the run used 3h of a 10-minute budget, so it is well "over" — the clamp
+	// must hold it at 0 rather than reporting a negative remainder.
+	if o.BudgetSeconds != 600 {
+		t.Fatalf("budget_seconds = %d, want 600", o.BudgetSeconds)
+	}
+	if o.BudgetLeftPct == nil || *o.BudgetLeftPct != 0 {
+		t.Fatalf("budget_left_pct = %v, want 0 (3h run against a 600s budget, clamped)", o.BudgetLeftPct)
+	}
+	// The split must reconstruct the reached total exactly, and this fixture reaches two
+	// linked assets — both anchored at the same moment, so both land on the same side.
+	if o.ReachAtMidpoint+o.LateReachGrowth != o.AssetsReached {
+		t.Fatalf("reach_at_midpoint(%d) + late_reach_growth(%d) != assets_reached(%d)",
+			o.ReachAtMidpoint, o.LateReachGrowth, o.AssetsReached)
+	}
+	if o.AssetsReached != 2 {
+		t.Fatalf("assets_reached = %d, want 2 (the fixture anchors two linked assets)", o.AssetsReached)
 	}
 
 	if err := d.UpsertTaskOutcome(ctx, o); err != nil {

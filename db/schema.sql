@@ -836,6 +836,16 @@ CREATE TABLE IF NOT EXISTS task_outcome (
     premature_exhaustion    INTEGER NOT NULL DEFAULT 0,
     thin_routes             JSONB   NOT NULL DEFAULT '[]'::jsonb,
 
+    -- 预算内广度：这次运行是「做完了」还是「不看了」。late_reach_growth = 后半程新铺开的
+    -- 资产数（用首次锚定时间切分，重复触碰不算新面）。接近 0 表示后半程没开出任何新面——
+    -- 无论看起来多忙。它配合 budget_left_pct 与 uncovered_assets，把「没预算了」和
+    -- 「主动收手」分开。reach_at_midpoint + late_reach_growth == coverage_tested（构造保证）。
+    budget_seconds          BIGINT  NOT NULL DEFAULT 0,
+    budget_left_pct         DOUBLE PRECISION,
+    assets_reached          INTEGER NOT NULL DEFAULT 0,
+    reach_at_midpoint       INTEGER NOT NULL DEFAULT 0,
+    late_reach_growth       INTEGER NOT NULL DEFAULT 0,
+
     duration_seconds        BIGINT  NOT NULL DEFAULT 0,
     tool_calls              INTEGER NOT NULL DEFAULT 0,
     tool_errors             INTEGER NOT NULL DEFAULT 0,
@@ -864,6 +874,13 @@ ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_inferred         INTEGER
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_observed         INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS premature_exhaustion   INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS thin_routes            JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 预算内广度（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS budget_seconds        BIGINT  NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS budget_left_pct       DOUBLE PRECISION;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS assets_reached        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS reach_at_midpoint     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS late_reach_growth     INTEGER NOT NULL DEFAULT 0;
 
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录
