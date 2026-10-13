@@ -445,6 +445,24 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
 	out["findings_total"] = len(vulnNodes)             // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
 	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
+	// surface：本任务已发现、但从未触碰的资产 —— 收官前必须处理的状态。
+	// 只在确实还有遗留时才出现，保持概览精简；为空即代表没有待覆盖的自有面。
+	// 与 list_untested_assets 的区别：后者按【任务范围】过滤，而范围谓词经常是错的
+	// （见 db.TaskScopeGap），真实运行里它一个都没显示出来；这里按【任务自己的关联资产】算。
+	if us, err := t.ts.UntouchedSurface(5); err == nil && us != nil && us.Untouched > 0 {
+		s := map[string]any{"untouched_assets": us.Untouched}
+		if us.BudgetLeftPct != nil {
+			s["budget_left_pct"] = *us.BudgetLeftPct
+		}
+		if len(us.Sample) > 0 {
+			labels := make([]string, 0, len(us.Sample))
+			for _, a := range us.Sample {
+				labels = append(labels, fmt.Sprintf("[%s] %s", a.Type, a.Label))
+			}
+			s["sample"] = labels
+		}
+		out["surface"] = s
+	}
 	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
 	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
@@ -1186,6 +1204,78 @@ func (t *ToolSet) requireVerifiedFinding(nodeID int64) error {
 	return fmt.Errorf("漏洞 #%d 尚未通过独立验证（当前状态 %s），不能作为目标达成的证据；请派一条验证意图、或等 verifier 出结论后再 prove_goal", nodeID, status)
 }
 
+// requireSurfaceReviewed blocks the goal that would complete the task while the run still
+// owns discovered assets it has never touched and budget left to touch them.
+//
+// The failure this closes was measured, not assumed. On OWASP Juice Shop the run ended
+// with 15 assets it had itself discovered and never worked on, and 33% of its time budget
+// unspent — and nothing in the system could see that, because the one tool that shows
+// remaining work (list_untested_assets) is bounded by the scope predicate, which matched
+// 1 of those 41 assets. Declaring done was the path of least resistance and it looked
+// exactly like success.
+//
+// Escape hatches, both deliberate:
+//   - a recorded waiver (accept_untested_surface): the planner may absolutely decide the
+//     remainder is not worth pursuing. The goal is to force the decision, not the coverage.
+//   - budget exhausted: out of room is a legitimate ending, not a premature one.
+func (t *ToolSet) requireSurfaceReviewed() error {
+	if t.ts == nil {
+		return nil
+	}
+	if reason, err := t.ts.SurfaceWaiver(); err == nil && reason != "" {
+		return nil // already decided; do not second-guess it
+	}
+	us, err := t.ts.UntouchedSurface(0)
+	if err != nil || us == nil || us.Untouched == 0 {
+		return nil
+	}
+	if us.BudgetLeftPct != nil && *us.BudgetLeftPct <= 0 {
+		return nil // out of budget; the run cannot do more
+	}
+	sample := ""
+	for i, a := range us.Sample {
+		if i >= 5 {
+			sample += " …"
+			break
+		}
+		sample += fmt.Sprintf("\n  - [%s] %s", a.Type, a.Label)
+	}
+	budget := "时间不限"
+	if us.BudgetLeftPct != nil {
+		budget = fmt.Sprintf("时间预算还剩 %.0f%%", *us.BudgetLeftPct*100)
+	}
+	return fmt.Errorf("收官被拦下：本任务还有 %d 个【你自己已发现、但从未触碰】的资产（%s）。"+
+		"把它们留在没碰过的状态就宣布完成，与「根本没注意到它们」无法区分。"+
+		"请先派意图去覆盖；若你判断它们不值得继续（例如确认无法推进、或超出本次目标），"+
+		"调 accept_untested_surface 说明理由后再 prove_goal。%s",
+		us.Untouched, budget, sample)
+}
+
+// acceptUntestedSurface records the planner's explicit decision to leave the remaining
+// discovered-but-untouched assets alone. See requireSurfaceReviewed.
+func (t *ToolSet) acceptUntestedSurface() actool.CoreTool {
+	return writeTool("accept_untested_surface",
+		"声明「剩下那些我已发现但从未触碰的资产，本次不再继续测试」并说明理由。"+
+			"收官前若被未触碰面检查拦下，派意图覆盖它们、或调本工具说明放弃理由，二者选一。",
+		obj(map[string]any{"reason": str("放弃这些资产的理由（如：已确认无法推进 / 超出本次目标 / 前提条件不具备）")}, "reason"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.Unmarshal(in, &a)
+			if strings.TrimSpace(a.Reason) == "" {
+				return actool.Errorf("reason 必填：说明你为什么不再继续测试这些资产"), nil
+			}
+			if t.ts == nil {
+				return actool.Errorf("探索存储不可用"), nil
+			}
+			if err := t.ts.SetSurfaceWaiver(a.Reason); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return actool.Text("已记录：剩余的未触碰面本次不再继续测试。可以继续收官的证明。"), nil
+		})
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
 		obj(map[string]any{
@@ -1217,6 +1307,23 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					return actool.Errorf(err.Error()), nil
 				}
 			}
+			// If this is the goal that completes the task, the surface review runs BEFORE
+			// anything is written, so a blocked call leaves the graph untouched and the
+			// planner can simply try again after acting on the message.
+			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
+				last := true
+				for _, g := range goals {
+					if g.ID != goal && g.State != "met" {
+						last = false
+						break
+					}
+				}
+				if last {
+					if err := t.requireSurfaceReviewed(); err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
+				}
+			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
@@ -1245,6 +1352,11 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// goal_met bypasses prove_goal entirely, so it must run the same surface review
+			// — otherwise it is a one-call way around the gate.
+			if err := t.requireSurfaceReviewed(); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
@@ -2073,6 +2185,8 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
+		// accept_untested_surface：收官前被未触碰面检查拦下时，规划者显式表态放弃剩余面。
+		t.acceptUntestedSurface(),
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),

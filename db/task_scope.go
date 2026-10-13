@@ -492,11 +492,14 @@ func (s *AssetStore) TaskBreadth(taskID, expID int64) (*TaskBreadth, error) {
 WITH linked AS (
   SELECT asset_id FROM task_asset_links WHERE task_id = $1
 ),
+-- fact OR finding, matching touchedCTE in task_surface.go: an asset that produced a
+-- finding was plainly worked on even without a separate fact node. Keeping one definition
+-- is what makes AssetsReached here and UntouchedSurface there add up to LinkedAssets.
 reached_at AS (
   SELECT ea.asset_id, min(n.created_at) AS first_at
   FROM exploration_anchors ea
   JOIN exploration_nodes n ON n.id = ea.node_id
-  WHERE n.exploration_id = $2 AND n.kind = 'fact'
+  WHERE n.exploration_id = $2 AND n.kind IN ('fact','finding')
   GROUP BY ea.asset_id
 ),
 bounds AS (

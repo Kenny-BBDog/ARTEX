@@ -163,6 +163,11 @@ CREATE TABLE IF NOT EXISTS explorations (
 -- planner wakes and processes a round. Drives the ≥R cold-node debounce (measured in
 -- this exploration's own rounds, not global node ids or wall-clock).
 ALTER TABLE explorations ADD COLUMN IF NOT EXISTS round_no BIGINT NOT NULL DEFAULT 0;
+
+-- 收尾时的"未触碰面"决定：规划者要么先覆盖掉自己已发现的资产，要么显式说明为什么放弃。
+-- 存的是【决定】，不是覆盖度——目标是强制表态，不是强制覆盖。
+ALTER TABLE explorations ADD COLUMN IF NOT EXISTS surface_waived_reason TEXT;
+ALTER TABLE explorations ADD COLUMN IF NOT EXISTS surface_waived_at     TIMESTAMPTZ;
 DROP TRIGGER IF EXISTS trg_exp_upd ON explorations;
 CREATE TRIGGER trg_exp_upd BEFORE UPDATE ON explorations
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
