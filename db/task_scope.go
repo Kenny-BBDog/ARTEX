@@ -325,6 +325,95 @@ tested AS (
 
 // TaskCoverage computes rough per-type coverage for a task. taskID indexes
 // task_scope + assets; expID indexes the fact anchors. Reference figure only.
+// covClaimCTE extends covTargetCTE with the two claim-side buckets. Reuses `target` and
+// `tested` so "reached" means exactly what Coverage.Tested means — the two definitions
+// must never drift, or the cross-product would compare apples to oranges.
+//
+// `claimed` keys off finding NODES (the act of asserting); `claimed_confirmed` requires
+// the finding ROW behind that node to have survived verification. Facts and findings are
+// separate anchor sources, so reached and claimed are genuinely independent sets.
+const covClaimCTE = covTargetCTE + `,
+claimed AS (
+  SELECT DISTINCT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes en ON en.id = ea.node_id
+  WHERE en.exploration_id = $2 AND en.kind = 'finding'
+),
+claimed_confirmed AS (
+  SELECT DISTINCT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes en ON en.id = ea.node_id
+  JOIN findings f ON f.node_id = en.id
+  WHERE en.exploration_id = $2 AND en.kind = 'finding' AND f.status = 'confirmed'
+)`
+
+// ClaimCoverage is the cross-product the flywheel turns on: of the in-scope assets we
+// actually reached, how many did we make a claim about — and how many did we walk past
+// in silence?
+//
+// The distinction is the whole point. A false positive (claimed, not upheld) tells you to
+// make the agent quieter; a silent miss (reached, claimed nothing) tells you it failed to
+// SEE — and only the second one makes it stronger. That signal exists only while
+// "reached" and "claimed" are independent records, which is exactly why the exploration
+// graph's node state must not be made to mirror findings.status.
+type ClaimCoverage struct {
+	Scope     int `json:"scope"`     // 范围内资产数（= Coverage.Denominator）
+	Reached   int `json:"reached"`   // 到过：有 fact 锚点（= Coverage.Tested）
+	Claimed   int `json:"claimed"`   // 说了：有 finding 锚点
+	Confirmed int `json:"confirmed"` // 说了且至少一条 finding 已被独立维持
+	// Silent = Reached - Claimed. Assets the agent touched, recorded an observation on,
+	// and then asserted nothing about. The flywheel's headline number.
+	Silent       int             `json:"silent"`
+	SilentAssets []CoverageAsset `json:"silent_assets"` // 上述资产的样本（最多 listLimit 条）
+}
+
+// TaskClaimCoverage computes the reached × claimed cross-product for one task. listLimit
+// caps the returned silent-asset sample (<=0 → 20); Silent is the true count regardless.
+//
+// Assets reached in an earlier run of the same exploration count as reached here, so a
+// resumed task does not look artificially silent.
+func (s *AssetStore) TaskClaimCoverage(taskID, expID int64, listLimit int) (*ClaimCoverage, error) {
+	if listLimit <= 0 {
+		listLimit = 20
+	}
+	out := &ClaimCoverage{SilentAssets: []CoverageAsset{}}
+	err := s.db.QueryRow(`
+WITH `+covClaimCTE+`
+SELECT
+  (SELECT count(*) FROM target),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM tested)),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM claimed)),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM claimed_confirmed)),
+  (SELECT count(*) FROM target t
+    WHERE t.id IN (SELECT asset_id FROM tested)
+      AND t.id NOT IN (SELECT asset_id FROM claimed))`,
+		taskID, expID).Scan(&out.Scope, &out.Reached, &out.Claimed, &out.Confirmed, &out.Silent)
+	if err != nil {
+		return nil, err
+	}
+	if out.Silent == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`
+WITH `+covClaimCTE+`
+SELECT t.id, t.type, t.label FROM target t
+WHERE t.id IN (SELECT asset_id FROM tested)
+  AND t.id NOT IN (SELECT asset_id FROM claimed)
+ORDER BY t.id LIMIT $3`, taskID, expID, listLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a CoverageAsset
+		if err := rows.Scan(&a.ID, &a.Type, &a.Label); err != nil {
+			return nil, err
+		}
+		out.SilentAssets = append(out.SilentAssets, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *AssetStore) TaskCoverage(taskID, expID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1`, taskID).Scan(&cov.ScopeRows)

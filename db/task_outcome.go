@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -45,6 +46,15 @@ type TaskOutcome struct {
 	CoverageDenominator int      `json:"coverage_denominator"`
 	CoverageTested      int      `json:"coverage_tested"`
 	CoveragePct         *float64 `json:"coverage_pct"`
+
+	// The reached × claimed cross-product (see ClaimCoverage). CoverageTested is the
+	// "reached" leg; these add what was *asserted* about those reached assets. The gap
+	// between them — SilentAssets — is the signal that makes the agent better rather than
+	// merely quieter, so it is stored rather than derived on read.
+	ClaimedAssets          int             `json:"claimed_assets"`
+	ClaimedConfirmedAssets int             `json:"claimed_confirmed_assets"`
+	SilentAssets           int             `json:"silent_assets"`
+	SilentAssetList        []CoverageAsset `json:"silent_asset_list"`
 
 	DurationSeconds int64 `json:"duration_seconds"`
 	ToolCalls       int   `json:"tool_calls"`
@@ -135,8 +145,23 @@ func (d *DB) ComputeTaskOutcome(ctx context.Context, taskID int64) (*TaskOutcome
 	if cov, err := d.Assets().TaskCoverage(taskID, o.ExplorationID); err == nil && cov != nil {
 		o.CoverageDenominator, o.CoverageTested, o.CoveragePct = cov.Denominator, cov.Tested, cov.Pct
 	}
+	// The claim side of the cross-product. Both calls read the same exploration anchors;
+	// keeping them separate statements mirrors how coverage already reaches into the asset
+	// store rather than duplicating its scope CTE inside the outcome SQL.
+	if cc, err := d.Assets().TaskClaimCoverage(taskID, o.ExplorationID, silentAssetSampleLimit); err == nil && cc != nil {
+		o.ClaimedAssets, o.ClaimedConfirmedAssets = cc.Claimed, cc.Confirmed
+		o.SilentAssets = cc.Silent
+		if cc.SilentAssets != nil {
+			o.SilentAssetList = cc.SilentAssets
+		}
+	}
 	return o, nil
 }
+
+// silentAssetSampleLimit caps how many silent assets ride along in the outcome row. The
+// count is exact; the list is a sample, because its purpose is to seed the next run's
+// intents and to let a planner be scored — not to be an exhaustive report.
+const silentAssetSampleLimit = 20
 
 // UpsertTaskOutcome writes (or refreshes) one task's outcome row. Idempotent: the sweep
 // may recompute the same task more than once as late writes land.
@@ -144,7 +169,11 @@ func (d *DB) UpsertTaskOutcome(ctx context.Context, o *TaskOutcome) error {
 	if o == nil || o.TaskID <= 0 {
 		return errors.New("task_outcome: task_id 必填")
 	}
-	_, err := d.ExecContext(ctx, `
+	silentJSON, err := json.Marshal(o.SilentAssetList)
+	if err != nil || len(o.SilentAssetList) == 0 {
+		silentJSON = []byte("[]")
+	}
+	_, err = d.ExecContext(ctx, `
 INSERT INTO task_outcome(
     task_id, exploration_id, status, completed_at, computed_at,
     llm_calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
@@ -152,8 +181,10 @@ INSERT INTO task_outcome(
     findings_claimed, findings_confirmed, findings_false_positive,
     findings_critical, findings_high, findings_medium, findings_low,
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
+    claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
     duration_seconds, tool_calls, tool_errors, idle_turns)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+        $24,$25,$26,$27::jsonb,$28,$29,$30,$31)
 ON CONFLICT (task_id) DO UPDATE SET
     exploration_id = EXCLUDED.exploration_id, status = EXCLUDED.status,
     completed_at = EXCLUDED.completed_at, computed_at = EXCLUDED.computed_at,
@@ -168,6 +199,9 @@ ON CONFLICT (task_id) DO UPDATE SET
     retests_fixed = EXCLUDED.retests_fixed,
     coverage_denominator = EXCLUDED.coverage_denominator, coverage_tested = EXCLUDED.coverage_tested,
     coverage_pct = EXCLUDED.coverage_pct,
+    claimed_assets = EXCLUDED.claimed_assets,
+    claimed_confirmed_assets = EXCLUDED.claimed_confirmed_assets,
+    silent_assets = EXCLUDED.silent_assets, silent_asset_list = EXCLUDED.silent_asset_list,
     duration_seconds = EXCLUDED.duration_seconds, tool_calls = EXCLUDED.tool_calls,
     tool_errors = EXCLUDED.tool_errors, idle_turns = EXCLUDED.idle_turns`,
 		o.TaskID, o.ExplorationID, o.Status, o.CompletedAt, o.ComputedAt,
@@ -176,6 +210,7 @@ ON CONFLICT (task_id) DO UPDATE SET
 		o.FindingsClaimed, o.FindingsConfirmed, o.FindingsFalsePositive,
 		o.FindingsCritical, o.FindingsHigh, o.FindingsMedium, o.FindingsLow,
 		o.RetestsFixed, o.CoverageDenominator, o.CoverageTested, o.CoveragePct,
+		o.ClaimedAssets, o.ClaimedConfirmedAssets, o.SilentAssets, string(silentJSON),
 		o.DurationSeconds, o.ToolCalls, o.ToolErrors, o.IdleTurns)
 	return err
 }
@@ -186,6 +221,7 @@ const outcomeCols = `task_id, exploration_id, status, completed_at, computed_at,
     findings_claimed, findings_confirmed, findings_false_positive,
     findings_critical, findings_high, findings_medium, findings_low,
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
+    claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
     duration_seconds, tool_calls, tool_errors, idle_turns`
 
 func scanOutcome(rows interface {
@@ -197,6 +233,7 @@ func scanOutcome(rows interface {
 	for rows.Next() {
 		o := &TaskOutcome{}
 		var completed sql.NullTime
+		var silentJSON []byte
 		if err := rows.Scan(
 			&o.TaskID, &o.ExplorationID, &o.Status, &completed, &o.ComputedAt,
 			&o.LLMCalls, &o.InputTokens, &o.OutputTokens, &o.CacheReadTokens, &o.CacheWriteTokens,
@@ -204,6 +241,7 @@ func scanOutcome(rows interface {
 			&o.FindingsClaimed, &o.FindingsConfirmed, &o.FindingsFalsePositive,
 			&o.FindingsCritical, &o.FindingsHigh, &o.FindingsMedium, &o.FindingsLow,
 			&o.RetestsFixed, &o.CoverageDenominator, &o.CoverageTested, &o.CoveragePct,
+			&o.ClaimedAssets, &o.ClaimedConfirmedAssets, &o.SilentAssets, &silentJSON,
 			&o.DurationSeconds, &o.ToolCalls, &o.ToolErrors, &o.IdleTurns,
 		); err != nil {
 			return nil, err
@@ -211,6 +249,11 @@ func scanOutcome(rows interface {
 		if completed.Valid {
 			t := completed.Time
 			o.CompletedAt = &t
+		}
+		// Always a non-null JSON array in the column, but an older row written before the
+		// column existed decodes to nothing — leave the slice nil rather than erroring.
+		if len(silentJSON) > 0 {
+			_ = json.Unmarshal(silentJSON, &o.SilentAssetList)
 		}
 		out = append(out, o)
 	}

@@ -803,12 +803,28 @@ CREATE TABLE IF NOT EXISTS task_outcome (
     coverage_tested         INTEGER NOT NULL DEFAULT 0,
     coverage_pct            DOUBLE PRECISION,
 
+    -- reached × claimed 交叉度量。coverage_tested 就是「到过」那一腿；下面几列补上
+    -- 「到过的资产上到底说了什么」。silent_assets = coverage_tested - claimed_assets，
+    -- 即「到了却什么都没说」——假阴性候选，飞轮的主输入。存下来而不是读时推导，因为
+    -- 它是要被对比和追踪的信号。silent_asset_list 是样本（最多 20 条），用于给下一轮
+    -- 派意图、给规划者打分。
+    claimed_assets          INTEGER NOT NULL DEFAULT 0,
+    claimed_confirmed_assets INTEGER NOT NULL DEFAULT 0,
+    silent_assets           INTEGER NOT NULL DEFAULT 0,
+    silent_asset_list       JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
     duration_seconds        BIGINT  NOT NULL DEFAULT 0,
     tool_calls              INTEGER NOT NULL DEFAULT 0,
     tool_errors             INTEGER NOT NULL DEFAULT 0,
     idle_turns              INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_task_outcome_completed ON task_outcome(completed_at DESC);
+
+-- reached × claimed 交叉度量（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_assets           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_confirmed_assets INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_assets            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_asset_list        JSONB   NOT NULL DEFAULT '[]'::jsonb;
 
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录

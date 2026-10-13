@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -23,6 +24,10 @@ func outcomeDB(t *testing.T) *DB {
 	}
 	return d
 }
+
+// claimSilentAssetID is set by outcomeFixture to the asset it deliberately reaches
+// without asserting anything on, so the cross-product assertion can name it exactly.
+var claimSilentAssetID int64
 
 // outcomeFixture builds one terminal task with data in every table the outcome
 // aggregation reads, so a single assertion can cover the whole metric surface.
@@ -85,6 +90,40 @@ VALUES ($1,'completed','fixed','{}')`, f1); err != nil {
 		t.Fatal(err)
 	}
 
+	// reached × claimed 交叉度量：两个范围内资产都「到过」(有 fact 锚点)，其中只有一个
+	// 被「说了」(有 finding 锚点)。剩下一格就是静默漏报——本 fixture 的 silent 样本。
+	assets := d.Assets()
+	expStore := d.Exploration(exp)
+	claimedDomain := fmt.Sprintf("outcome-claimed-%d.invalid", task.ID)
+	silentDomain := fmt.Sprintf("outcome-silent-%d.invalid", task.ID)
+	claimedAsset, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: claimedDomain, TaskID: task.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	silentAsset, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: silentDomain, TaskID: task.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimSilentAssetID = silentAsset
+	for _, dom := range []string{claimedDomain, silentDomain} {
+		if _, err := assets.AddAgentScope(task.ID, "root_domain", dom, "test", "agent"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, aid := range []int64{claimedAsset, silentAsset} {
+		if _, err := expStore.AddNode(KindFact, map[string]any{"summary": "observed"}, 0, "confirmed", "worker", []int64{aid}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	findingNode, err := expStore.AddNode(KindFinding, map[string]any{"summary": "claims the claimed asset"}, 0, "confirmed", "worker", []int64{claimedAsset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reuse f1 rather than adding a row: findings_claimed is asserted as 3 above.
+	if _, err := d.Exec(`UPDATE findings SET node_id=$1 WHERE id=$2`, findingNode, f1); err != nil {
+		t.Fatal(err)
+	}
+
 	// 终态 + 首跑时间（duration 从 first_run_at 起算）。
 	back := time.Now().Add(-3 * time.Hour)
 	if _, err := d.Exec(`UPDATE tasks SET first_run_at=$1 WHERE id=$2`, back, task.ID); err != nil {
@@ -135,6 +174,22 @@ func TestComputeAndStoreTaskOutcome(t *testing.T) {
 	}
 	if o.DurationSeconds < 3*3600-5 || o.DurationSeconds > 3*3600+60 {
 		t.Fatalf("duration = %ds, want ≈3h (measured from first_run_at)", o.DurationSeconds)
+	}
+
+	// The reached × claimed cross-product rides along on the same row. The fixture
+	// reaches two assets (fact-anchored, = coverage_tested) and asserts on one of them,
+	// leaving exactly one silent asset — see claimFixture.
+	if o.CoverageTested != 2 {
+		t.Fatalf("coverage_tested = %d, want 2 (the reached leg)", o.CoverageTested)
+	}
+	if o.ClaimedAssets != 1 || o.ClaimedConfirmedAssets != 1 {
+		t.Fatalf("claimed=%d claimed_confirmed=%d, want 1/1", o.ClaimedAssets, o.ClaimedConfirmedAssets)
+	}
+	if o.SilentAssets != 1 {
+		t.Fatalf("silent_assets = %d, want 1 (reached 2, claimed 1)", o.SilentAssets)
+	}
+	if len(o.SilentAssetList) != 1 || o.SilentAssetList[0].ID != claimSilentAssetID {
+		t.Fatalf("silent_asset_list = %+v, want the one silent asset id=%d", o.SilentAssetList, claimSilentAssetID)
 	}
 
 	if err := d.UpsertTaskOutcome(ctx, o); err != nil {
