@@ -414,6 +414,91 @@ ORDER BY t.id LIMIT $3`, taskID, expID, listLimit)
 	return out, rows.Err()
 }
 
+// ScopeGapAsset is one asset the task linked but its own scope does not cover.
+type ScopeGapAsset struct {
+	ID     int64  `json:"id"`
+	Type   string `json:"type"`
+	Label  string `json:"label"`
+	Source string `json:"source"` // task | agent | system — how the asset got linked
+}
+
+// ScopeGap measures the leak *upstream* of the reached × claimed cross-product: assets
+// the task has taken ownership of that its own scope predicate does not cover.
+//
+// The denominator of every coverage figure comes from task_scope. So an asset outside
+// the scope is not merely "untested" — it is invisible: it never enters the denominator,
+// never counts as a silent miss, and never shows up in the untested backlog. A scope that
+// under-covers therefore suppresses exactly the misses the flywheel is trying to surface,
+// which is why the gap has to be measured on its own.
+//
+// UncoveredAgent is the diagnostic that makes this actionable, because it separates two
+// very different failures:
+//
+//   - gap among task/system-linked assets → the scope bookkeeping failed (the platform
+//     associated an asset and then never scoped it).
+//   - gap among agent-linked assets      → a worker inserted an asset via insert_assets
+//     that its own authorization does not cover. That is the agent reaching outside the
+//     scope it was given, which is a correctness-and-safety signal, not a bookkeeping one.
+//
+// In both cases the asset is genuinely being worked on — it is the scope predicate that
+// disagrees with the asset's shape, not the other way round.
+type ScopeGap struct {
+	Linked          int             `json:"linked"`           // 关联到本任务的资产数（task_asset_links）
+	Uncovered       int             `json:"uncovered"`        // 其中范围谓词覆盖不到的 = 缺口
+	UncoveredAgent  int             `json:"uncovered_agent"`  // 缺口里由 worker insert_assets 带进来的
+	UncoveredAssets []ScopeGapAsset `json:"uncovered_assets"` // 上述资产的样本（最多 listLimit 条）
+}
+
+// TaskScopeGap computes the linked-but-unscoped gap for one task. listLimit caps the
+// sample (<=0 → 20); Uncovered is the true count regardless.
+//
+// "Linked" is task_asset_links, the authoritative task↔asset association (it carries the
+// provenance this metric needs). "Covered" is the same covTargetCTE every coverage figure
+// uses — reusing it is deliberate, so the gap can never disagree with the denominator it
+// is explaining.
+func (s *AssetStore) TaskScopeGap(taskID, expID int64, listLimit int) (*ScopeGap, error) {
+	if listLimit <= 0 {
+		listLimit = 20
+	}
+	out := &ScopeGap{UncoveredAssets: []ScopeGapAsset{}}
+	covered := `EXISTS (SELECT 1 FROM target t WHERE t.id = l.asset_id)`
+	err := s.db.QueryRow(`
+WITH `+covTargetCTE+`,
+linked AS (SELECT asset_id, source FROM task_asset_links WHERE task_id = $1)
+SELECT
+  (SELECT count(*) FROM linked),
+  (SELECT count(*) FROM linked l WHERE NOT `+covered+`),
+  (SELECT count(*) FROM linked l WHERE l.source = 'agent' AND NOT `+covered+`)`,
+		taskID, expID).Scan(&out.Linked, &out.Uncovered, &out.UncoveredAgent)
+	if err != nil {
+		return nil, err
+	}
+	if out.Uncovered == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`
+WITH `+covTargetCTE+`,
+linked AS (SELECT asset_id, source FROM task_asset_links WHERE task_id = $1)
+SELECT a.id, a.type, COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, ''), l.source
+FROM linked l
+JOIN assets a ON a.id = l.asset_id
+WHERE NOT `+covered+`
+ORDER BY (l.source = 'agent') DESC, a.id
+LIMIT $3`, taskID, expID, listLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a ScopeGapAsset
+		if err := rows.Scan(&a.ID, &a.Type, &a.Label, &a.Source); err != nil {
+			return nil, err
+		}
+		out.UncoveredAssets = append(out.UncoveredAssets, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *AssetStore) TaskCoverage(taskID, expID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1`, taskID).Scan(&cov.ScopeRows)

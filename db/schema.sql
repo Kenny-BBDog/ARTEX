@@ -813,6 +813,15 @@ CREATE TABLE IF NOT EXISTS task_outcome (
     silent_assets           INTEGER NOT NULL DEFAULT 0,
     silent_asset_list       JSONB   NOT NULL DEFAULT '[]'::jsonb,
 
+    -- 交叉度量的【上游】缺口：任务已关联、但自身范围谓词覆盖不到的资产。这些资产根本
+    -- 进不了分母，所以既不算 silent 也不进未测清单——范围漏了，漏报就被一起藏起来了。
+    -- uncovered_agent_assets 单独数出「worker 自己 insert_assets 带进来、却在范围外」的
+    -- 那部分：那是 agent 走出了给它的授权范围（正确性/安全问题），而不是平台记账没跟上。
+    linked_assets           INTEGER NOT NULL DEFAULT 0,
+    uncovered_assets        INTEGER NOT NULL DEFAULT 0,
+    uncovered_agent_assets  INTEGER NOT NULL DEFAULT 0,
+    uncovered_asset_list    JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
     duration_seconds        BIGINT  NOT NULL DEFAULT 0,
     tool_calls              INTEGER NOT NULL DEFAULT 0,
     tool_errors             INTEGER NOT NULL DEFAULT 0,
@@ -825,6 +834,12 @@ ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_assets           INTEG
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_confirmed_assets INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_assets            INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_asset_list        JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 范围缺口（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS linked_assets            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_assets         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_agent_assets   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_asset_list     JSONB   NOT NULL DEFAULT '[]'::jsonb;
 
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录

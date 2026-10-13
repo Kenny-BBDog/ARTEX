@@ -29,6 +29,10 @@ func outcomeDB(t *testing.T) *DB {
 // without asserting anything on, so the cross-product assertion can name it exactly.
 var claimSilentAssetID int64
 
+// gapAssetID is set by outcomeFixture to the asset it links to the task but deliberately
+// leaves outside the scope predicate.
+var gapAssetID int64
+
 // outcomeFixture builds one terminal task with data in every table the outcome
 // aggregation reads, so a single assertion can cover the whole metric surface.
 func outcomeFixture(t *testing.T) (*DB, *Task) {
@@ -110,6 +114,20 @@ VALUES ($1,'completed','fixed','{}')`, f1); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// 范围缺口：一个被关联、但自身范围覆盖不到的资产。它不进分母，所以既不算 silent
+	// 也不进未测清单——必须单独数出来。来源标 agent：是 worker 自己插进来的。
+	gapDomain := fmt.Sprintf("outcome-gap-%d.invalid", task.ID)
+	gapAsset, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: gapDomain, TaskID: task.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assets.AttachAssetsToTask(task.ID, []int64{claimedAsset, silentAsset, gapAsset}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if err := assets.SetTaskAssetSource(task.ID, gapAsset, "agent", "fixture worker insert", nil); err != nil {
+		t.Fatal(err)
+	}
+	gapAssetID = gapAsset
 	for _, aid := range []int64{claimedAsset, silentAsset} {
 		if _, err := expStore.AddNode(KindFact, map[string]any{"summary": "observed"}, 0, "confirmed", "worker", []int64{aid}); err != nil {
 			t.Fatal(err)
@@ -190,6 +208,22 @@ func TestComputeAndStoreTaskOutcome(t *testing.T) {
 	}
 	if len(o.SilentAssetList) != 1 || o.SilentAssetList[0].ID != claimSilentAssetID {
 		t.Fatalf("silent_asset_list = %+v, want the one silent asset id=%d", o.SilentAssetList, claimSilentAssetID)
+	}
+
+	// The upstream gap: three assets linked, one of them outside the scope predicate, so it
+	// never entered the denominator the two lines above are computed over.
+	if o.LinkedAssets != 3 {
+		t.Fatalf("linked_assets = %d, want 3", o.LinkedAssets)
+	}
+	if o.UncoveredAssets != 1 || o.UncoveredAgentAssets != 1 {
+		t.Fatalf("uncovered=%d uncovered_agent=%d, want 1/1", o.UncoveredAssets, o.UncoveredAgentAssets)
+	}
+	if len(o.UncoveredAssetList) != 1 || o.UncoveredAssetList[0].ID != gapAssetID {
+		t.Fatalf("uncovered_asset_list = %+v, want the gap asset id=%d", o.UncoveredAssetList, gapAssetID)
+	}
+	if o.UncoveredAssetList[0].Source != "agent" {
+		t.Fatalf("gap asset source = %q, want agent (the provenance that makes the gap actionable)",
+			o.UncoveredAssetList[0].Source)
 	}
 
 	if err := d.UpsertTaskOutcome(ctx, o); err != nil {

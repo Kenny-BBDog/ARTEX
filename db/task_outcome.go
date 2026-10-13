@@ -56,6 +56,15 @@ type TaskOutcome struct {
 	SilentAssets           int             `json:"silent_assets"`
 	SilentAssetList        []CoverageAsset `json:"silent_asset_list"`
 
+	// The gap *upstream* of the cross-product: assets the task owns but its own scope
+	// does not cover, so they never entered the denominator at all. UncoveredAgent splits
+	// out the ones a worker inserted itself — a scope the agent outgrew, rather than
+	// bookkeeping that fell behind. See ScopeGap.
+	LinkedAssets         int             `json:"linked_assets"`
+	UncoveredAssets      int             `json:"uncovered_assets"`
+	UncoveredAgentAssets int             `json:"uncovered_agent_assets"`
+	UncoveredAssetList   []ScopeGapAsset `json:"uncovered_asset_list"`
+
 	DurationSeconds int64 `json:"duration_seconds"`
 	ToolCalls       int   `json:"tool_calls"`
 	ToolErrors      int   `json:"tool_errors"`
@@ -155,6 +164,14 @@ func (d *DB) ComputeTaskOutcome(ctx context.Context, taskID int64) (*TaskOutcome
 			o.SilentAssetList = cc.SilentAssets
 		}
 	}
+	// The scope gap rides along because it explains the denominator the two blocks above
+	// are divided by: an asset outside the scope is not "silent", it is uncountable.
+	if sg, err := d.Assets().TaskScopeGap(taskID, o.ExplorationID, silentAssetSampleLimit); err == nil && sg != nil {
+		o.LinkedAssets, o.UncoveredAssets, o.UncoveredAgentAssets = sg.Linked, sg.Uncovered, sg.UncoveredAgent
+		if sg.UncoveredAssets != nil {
+			o.UncoveredAssetList = sg.UncoveredAssets
+		}
+	}
 	return o, nil
 }
 
@@ -173,6 +190,10 @@ func (d *DB) UpsertTaskOutcome(ctx context.Context, o *TaskOutcome) error {
 	if err != nil || len(o.SilentAssetList) == 0 {
 		silentJSON = []byte("[]")
 	}
+	uncoveredJSON, err := json.Marshal(o.UncoveredAssetList)
+	if err != nil || len(o.UncoveredAssetList) == 0 {
+		uncoveredJSON = []byte("[]")
+	}
 	_, err = d.ExecContext(ctx, `
 INSERT INTO task_outcome(
     task_id, exploration_id, status, completed_at, computed_at,
@@ -182,9 +203,10 @@ INSERT INTO task_outcome(
     findings_critical, findings_high, findings_medium, findings_low,
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
     claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
+    linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
     duration_seconds, tool_calls, tool_errors, idle_turns)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
-        $24,$25,$26,$27::jsonb,$28,$29,$30,$31)
+        $24,$25,$26,$27::jsonb,$28,$29,$30,$31::jsonb,$32,$33,$34,$35)
 ON CONFLICT (task_id) DO UPDATE SET
     exploration_id = EXCLUDED.exploration_id, status = EXCLUDED.status,
     completed_at = EXCLUDED.completed_at, computed_at = EXCLUDED.computed_at,
@@ -202,6 +224,9 @@ ON CONFLICT (task_id) DO UPDATE SET
     claimed_assets = EXCLUDED.claimed_assets,
     claimed_confirmed_assets = EXCLUDED.claimed_confirmed_assets,
     silent_assets = EXCLUDED.silent_assets, silent_asset_list = EXCLUDED.silent_asset_list,
+    linked_assets = EXCLUDED.linked_assets, uncovered_assets = EXCLUDED.uncovered_assets,
+    uncovered_agent_assets = EXCLUDED.uncovered_agent_assets,
+    uncovered_asset_list = EXCLUDED.uncovered_asset_list,
     duration_seconds = EXCLUDED.duration_seconds, tool_calls = EXCLUDED.tool_calls,
     tool_errors = EXCLUDED.tool_errors, idle_turns = EXCLUDED.idle_turns`,
 		o.TaskID, o.ExplorationID, o.Status, o.CompletedAt, o.ComputedAt,
@@ -211,6 +236,7 @@ ON CONFLICT (task_id) DO UPDATE SET
 		o.FindingsCritical, o.FindingsHigh, o.FindingsMedium, o.FindingsLow,
 		o.RetestsFixed, o.CoverageDenominator, o.CoverageTested, o.CoveragePct,
 		o.ClaimedAssets, o.ClaimedConfirmedAssets, o.SilentAssets, string(silentJSON),
+		o.LinkedAssets, o.UncoveredAssets, o.UncoveredAgentAssets, string(uncoveredJSON),
 		o.DurationSeconds, o.ToolCalls, o.ToolErrors, o.IdleTurns)
 	return err
 }
@@ -222,6 +248,7 @@ const outcomeCols = `task_id, exploration_id, status, completed_at, computed_at,
     findings_critical, findings_high, findings_medium, findings_low,
     retests_fixed, coverage_denominator, coverage_tested, coverage_pct,
     claimed_assets, claimed_confirmed_assets, silent_assets, silent_asset_list,
+    linked_assets, uncovered_assets, uncovered_agent_assets, uncovered_asset_list,
     duration_seconds, tool_calls, tool_errors, idle_turns`
 
 func scanOutcome(rows interface {
@@ -233,7 +260,7 @@ func scanOutcome(rows interface {
 	for rows.Next() {
 		o := &TaskOutcome{}
 		var completed sql.NullTime
-		var silentJSON []byte
+		var silentJSON, uncoveredJSON []byte
 		if err := rows.Scan(
 			&o.TaskID, &o.ExplorationID, &o.Status, &completed, &o.ComputedAt,
 			&o.LLMCalls, &o.InputTokens, &o.OutputTokens, &o.CacheReadTokens, &o.CacheWriteTokens,
@@ -242,6 +269,7 @@ func scanOutcome(rows interface {
 			&o.FindingsCritical, &o.FindingsHigh, &o.FindingsMedium, &o.FindingsLow,
 			&o.RetestsFixed, &o.CoverageDenominator, &o.CoverageTested, &o.CoveragePct,
 			&o.ClaimedAssets, &o.ClaimedConfirmedAssets, &o.SilentAssets, &silentJSON,
+			&o.LinkedAssets, &o.UncoveredAssets, &o.UncoveredAgentAssets, &uncoveredJSON,
 			&o.DurationSeconds, &o.ToolCalls, &o.ToolErrors, &o.IdleTurns,
 		); err != nil {
 			return nil, err
@@ -254,6 +282,9 @@ func scanOutcome(rows interface {
 		// column existed decodes to nothing — leave the slice nil rather than erroring.
 		if len(silentJSON) > 0 {
 			_ = json.Unmarshal(silentJSON, &o.SilentAssetList)
+		}
+		if len(uncoveredJSON) > 0 {
+			_ = json.Unmarshal(uncoveredJSON, &o.UncoveredAssetList)
 		}
 		out = append(out, o)
 	}
