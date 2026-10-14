@@ -1,12 +1,15 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
@@ -99,9 +102,9 @@ func (sc *Scheduler) deriveLessons(taskID int64, dataDir string) {
 		if summary == "" {
 			continue
 		}
-		name := lessonName(taskID, f.ID)
+		name := lessonName(hostToken, summary)
 		if known[name] {
-			continue // 恢复/重放 sweep 重扫同一任务：同名字段即幂等
+			continue // 同目标同结论已入库：内容寻址天然幂等（重放 sweep / 跨任务重复结论都跳过）
 		}
 		if err := store.Save(memory.Memory{
 			Name: name,
@@ -143,11 +146,38 @@ func renderLesson(target string, taskID, factID int64, p map[string]any) string 
 	return out
 }
 
-// lessonName is stable and ASCII-only: norma/memory slugs entry names to
-// [a-z0-9-] (memory.go slugRe), so a Chinese name would slug to empty.
-// Content and description stay Chinese; only the name must survive the slug.
-func lessonName(taskID, factID int64) string {
-	return fmt.Sprintf("obs-t%d-f%d", taskID, factID)
+// lessonName is content-addressed: target + the conclusion statement, hashed.
+//
+// Two properties, both measured-for. Deterministic: re-running the sweep on the
+// same task, or reaching the same conclusion in a later task, resolves to the
+// same name and dedupes — the library holds conclusions, not mentions.
+// Collision-proof: the first cut keyed on task id + fact id, which silently
+// dropped run-8's conclusions because our e2e harness resets the DB per run and
+// every task is id 1 — run 8's fact #24 was "already present" as run 7's. Task
+// ids are unique in production so the bug hid there, but keying identity on
+// provenance rather than on the claim is wrong in both worlds.
+//
+// ASCII by contract: norma/memory slugs names through [^a-z0-9] (- and _ survive
+// as separators), so a Chinese name would slug to empty and never persist.
+func lessonName(hostToken, summary string) string {
+	key := strings.ToLower(strings.TrimSpace(hostToken) + "|" + strings.Join(lessonTokens(summary), " "))
+	sum := sha256.Sum256([]byte(key))
+	return "obs-" + hex.EncodeToString(sum[:])[:12]
+}
+
+// lessonTokens normalises a conclusion into comparable tokens for the name key.
+// Kept: ASCII [a-z0-9_] and CJK ideographs (unicode.Han) — the latter so two
+// Chinese summaries differing only in punctuation hash alike. Dropped: everything
+// else, including CJK punctuation, which is NOT Han ("接口，" must equal "接口").
+func lessonTokens(s string) []string {
+	return strings.Fields(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', unicode.Is(unicode.Han, r):
+			return r
+		default:
+			return ' '
+		}
+	}, strings.ToLower(s)))
 }
 
 // hostSlug glues the first host-ish token of the task description into one ASCII

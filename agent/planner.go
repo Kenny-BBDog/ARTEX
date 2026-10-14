@@ -11,6 +11,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/memory"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -382,6 +383,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
 	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	// 共享大脑 push（planner 侧）：按当前【态势】（任务 goal + 根描述）选经验。
+	// planner 要决定"往哪派"，所以给它的是方向级经验；worker 拿到的是意图级
+	// （见 worker.go 同名注释，两者查询面不同是刻意的）。
+	if goal, desc, _ := ts.Root(); desc != "" || goal != "" {
+		if lessons := injectLessons(memory.NewStore(memoryPath(p.workDir)), desc+" "+goal); lessons != "" {
+			situational += lessons
+		}
+	}
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。

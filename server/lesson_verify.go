@@ -9,7 +9,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/memory"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -113,11 +112,15 @@ func (s *Server) lessonConflictTools() []actool.CoreTool {
 				if s.m.pg == nil {
 					return actool.Errorf("数据库不可用"), nil
 				}
-				if _, err := s.m.pg.Exec(`INSERT INTO activity(exploration_id, node_id, kind, worker, summary, detail)
-					VALUES (0, NULL, 'lesson_quashed', $1, $2, $3)`,
-					db.VerifierAgentKey, "经验条目被否证删除: "+name, strings.TrimSpace(a.Evidence)); err != nil {
+				// Audit into server_logs, not activity: activity rows carry an
+				// exploration_id FK and this event belongs to no exploration (the
+				// first cut inserted exploration_id=0 and the FK rejected it —
+				// the deletion had already happened, so the audit was silently
+				// lost exactly when it mattered).
+				if _, err := s.m.pg.InsertLog("warn", "lessons",
+					fmt.Sprintf("verifier 否证删除经验条目 %q：%s", name, strings.TrimSpace(a.Evidence))); err != nil {
 					// 审计失败不回滚删除 —— 一个没有日志的删除仍好过一个被静默覆盖的事实。
-					log.Printf("[lessons] 审计日志写入失败（删除已生效）: %v", err)
+					log.Printf("[lessons] 审计写入失败（删除已生效）: %v", err)
 				}
 				log.Printf("[lessons] verifier 否证删除条目 %q：%s", name, oneline(a.Evidence, 120))
 				return jsonResult(map[string]any{"quashed": name})

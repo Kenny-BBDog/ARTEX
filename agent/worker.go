@@ -15,6 +15,7 @@ import (
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/memory"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -490,6 +491,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	input := overview
 	if strings.TrimSpace(input) == "" {
 		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+	}
+	// 共享大脑的 push 投递：【按本意图】挑选过往观察（不是按全场态势——run 7 实测
+	// 按势态挑选时每场都拿到同样的同目标经验包，与意图错位），进启动 user 消息首拍。
+	if lessons := injectLessons(memory.NewStore(memoryPath(w.workDir)), intentLessonQuery(intent)); lessons != "" {
+		input += lessons
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。

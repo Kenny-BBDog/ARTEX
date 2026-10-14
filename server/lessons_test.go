@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,7 +88,7 @@ func TestDeriveLessonsWritesOnlyObservedConclusions(t *testing.T) {
 		t.Fatalf("expected exactly the 2 observed facts as lessons, got %d: %v", len(entries), entries)
 	}
 	for _, n := range entries {
-		if !strings.HasPrefix(n, fmt.Sprintf("obs-t%d-f", task.ID)) {
+		if !strings.HasPrefix(n, "obs-") {
 			t.Errorf("unexpected lesson name %q", n)
 		}
 	}
@@ -204,12 +203,27 @@ func TestLessonDeliveryMatchesWriteStore(t *testing.T) {
 // norma/memory slugs entry names through [^a-z0-9]+ (memory.go slugRe), so a
 // Chinese name would slug to an empty string and silently fail to persist.
 func TestLessonEntryNamesSurviveSlug(t *testing.T) {
-	name := lessonName(7, 12)
+	name := lessonName("jslocal", "本部署不存在 GraphQL 接口，/graphql 与 /api/graphql 均 404")
 	for _, c := range name {
 		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' {
 			continue
 		}
 		t.Fatalf("lessonName produced %q which norma/memory would slug away", name)
+	}
+	if !strings.HasPrefix(name, "obs-") {
+		t.Fatalf("lessonName = %q, want the obs- prefix", name)
+	}
+	// Content-addressed: the same claim on the same target is ONE entry, however
+	// it was punctuated or ordered...
+	if lessonName("jslocal", "本部署不存在 GraphQL 接口 /graphql 与 /api/graphql 均 404") != name {
+		t.Error("same conclusion produced two names — the library would store the claim twice")
+	}
+	// ...while a different claim, or the same claim on another target, does not collide.
+	if lessonName("jslocal", "JWT 接受 alg:none") == name {
+		t.Error("different conclusions collided onto one name")
+	}
+	if lessonName("corplocal", "本部署不存在 GraphQL 接口，/graphql 与 /api/graphql 均 404") == name {
+		t.Error("the same conclusion on a different target collided onto one name")
 	}
 	// And the directory the write side uses is the one memoryInject reads.
 	if want := filepath.Join("data", "memory"); memoryDirPath("data") != want {
