@@ -16,10 +16,24 @@ import (
 )
 
 // verifierToolCallMessage is the trigger message the scheduler hands the verifier
-// when a worker calls report_finding. It has to be self-sufficient: unlike the
-// retester, a triggered run has no server-owned conversation row tying it to one
-// finding, so the agent is told how to find its worklist instead of being handed an id.
-const verifierToolCallMessage = "上面刚有一个漏洞被 report_finding 登记。请先用 list_candidate_findings 读回待验证的漏洞（含原始证据），" +
+// when a worker calls report_finding. The run is BOUND to the finding that call just
+// registered: the scheduler reads its id out of the tool result and puts it in the
+// run's context, and the tools enforce it on both reads and writes. The message says
+// so, because an agent that believes it may pick any candidate will spend its run
+// calling list_candidate_findings with ids the scope rejects.
+const verifierToolCallMessage = "上面刚有一个漏洞被 report_finding 登记，本次验证【被绑定在这一条漏洞上】。" +
+	"请先用 list_candidate_findings 读回它（含原始证据；本次会话不接受别的 finding_id），" +
+	"再用与原始证据【不同】的路径或独立命令独立复现一次（做对照、换入口、换观察面），" +
+	"最后用 record_finding_verification(finding_id, verdict, summary, evidence) 落结论：" +
+	"复现成功用 confirmed，尝试后未能复现用 unverified，无法判定用 inconclusive。" +
+	"禁止把原始证据换个措辞复述当作验证通过；拿不准就用 inconclusive。"
+
+// verifierToolCallMessageV1 is the wording used before trigger runs carried a scope.
+// Back then the agent was told to find its own work in a global candidate list. The
+// tools now refuse any id other than the bound one, so leaving the old text in an
+// upgraded database sends the model straight into a rejected call. Only triggers
+// still holding this exact wording are rewritten — see upgradeVerifierTriggerMessage.
+const verifierToolCallMessageV1 = "上面刚有一个漏洞被 report_finding 登记。请先用 list_candidate_findings 读回待验证的漏洞（含原始证据），" +
 	"再用与原始证据【不同】的路径或独立命令独立复现一次（做对照、换入口、换观察面），" +
 	"最后用 record_finding_verification(finding_id, verdict, summary, evidence) 落结论：" +
 	"复现成功用 confirmed，尝试后未能复现用 unverified，无法判定用 inconclusive。" +
@@ -30,7 +44,7 @@ const verifierToolCallMessage = "上面刚有一个漏洞被 report_finding 登�
 func (s *Server) findingVerificationTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		roTool("list_candidate_findings",
-			"列出尚未通过独立验证的漏洞（status=candidate），含原始证据，供你挑选要复现的那一条。传入 finding_id 时只返回该条。",
+			"列出尚未通过独立验证的漏洞（status=candidate 或 pending），含原始证据。本次会话若是被某条漏洞的 report_finding 唤起，则被绑定在那一条上，只会返回它，传入别的 finding_id 会被拒绝。传入 finding_id 时只返回该条。",
 			objSchema(map[string]any{
 				"finding_id": map[string]any{"type": "integer", "description": "可选：只看这一条漏洞"},
 				"limit":      map[string]any{"type": "integer", "description": "可选：最多返回几条，默认 20，上限 100"},
@@ -43,13 +57,39 @@ func (s *Server) findingVerificationTools() []actool.CoreTool {
 					Limit     int   `json:"limit"`
 				}
 				_ = json.Unmarshal(in, &a)
-				items, err := s.m.pg.CandidateFindings(a.Limit)
-				if err != nil {
-					return actool.Errorf(err.Error()), nil
+				// 触发作用域：本次会话是为哪一条漏洞起的。有作用域时只可能读到它，
+				// 换别的 id 直接拒绝——否则一个为 task A 的漏洞起的验证会话，可以
+				// 从全局候选列表里挑走 task B 的候选，把 B 的结论记成 A 的。
+				if scope := intercept.TriggerFindingFromContext(ctx); scope > 0 {
+					if a.FindingID > 0 && a.FindingID != scope {
+						return actool.Errorf(fmt.Sprintf("本次验证被绑定在漏洞 #%d 上，不能读取 #%d", scope, a.FindingID)), nil
+					}
+					a.FindingID = scope
+				}
+				var items []*db.DBFinding
+				if a.FindingID > 0 {
+					f, err := s.m.pg.GetFinding(a.FindingID)
+					if err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
+					if f != nil {
+						items = []*db.DBFinding{f}
+					}
+				} else {
+					var err error
+					items, err = s.m.pg.CandidateFindings(a.Limit)
+					if err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
 				}
 				out := make([]map[string]any, 0, len(items))
 				for _, f := range items {
 					if a.FindingID > 0 && f.ID != a.FindingID {
+						continue
+					}
+					// 只交出仍待裁决的那些：人工已经处置过的（false_positive / fixed …）
+					// 不该被 verifier 的结论覆盖，取回它们只会误导。
+					if !db.UnadjudicatedStatus(f.Status) {
 						continue
 					}
 					out = append(out, map[string]any{
@@ -66,13 +106,13 @@ func (s *Server) findingVerificationTools() []actool.CoreTool {
 					})
 				}
 				if a.FindingID > 0 && len(out) == 0 {
-					return actool.Errorf(fmt.Sprintf("漏洞 #%d 不存在，或已不是待验证(candidate)状态——可能已通过验证或已被人工处置", a.FindingID)), nil
+					return actool.Errorf(fmt.Sprintf("漏洞 #%d 不存在，或已不是待验证状态（candidate/pending）——可能已通过验证或已被人工处置", a.FindingID)), nil
 				}
 				return jsonResult(map[string]any{"candidates": out, "count": len(out)})
 			}),
 
 		wrTool("record_finding_verification",
-			"为指定的漏洞保存本次独立验证的唯一结论。只有 confirmed 会把漏洞状态提升为已确认；unverified / inconclusive 保持待验证不变。必须提供本次实际复现的证据，无法判定时写明阻塞原因。",
+			"为指定的漏洞保存本次独立验证的唯一结论。只有 confirmed 会把漏洞状态提升为已确认；unverified / inconclusive 保持待验证不变。本次会话若被绑定在一条漏洞上，只能给那一条落结论。必须提供本次实际复现的证据，无法判定时写明阻塞原因。",
 			objSchema(map[string]any{
 				"finding_id": map[string]any{"type": "integer", "description": "要落结论的漏洞 id（来自 list_candidate_findings）"},
 				"verdict":    map[string]any{"type": "string", "enum": []string{db.VerdictConfirmed, db.VerdictUnverified, db.VerdictInconclusive}, "description": "confirmed=独立复现成功；unverified=尝试后未能复现；inconclusive=无法判定"},
@@ -91,6 +131,11 @@ func (s *Server) findingVerificationTools() []actool.CoreTool {
 				}
 				if err := json.Unmarshal(in, &a); err != nil {
 					return actool.Errorf(err.Error()), nil
+				}
+				// 读侧已经限定过一次，写侧再限一次：作用域是这次运行的属性，不能靠
+				// 模型自觉。少了这道校验，被绑在 #7 上的会话仍可给 #9 落结论。
+				if scope := intercept.TriggerFindingFromContext(ctx); scope > 0 && a.FindingID != scope {
+					return actool.Errorf(fmt.Sprintf("本次验证被绑定在漏洞 #%d 上，不能给 #%d 落结论；请用 list_candidate_findings 读回被绑定的那一条", scope, a.FindingID)), nil
 				}
 				if utf8.RuneCountInString(a.Evidence) > 20000 {
 					return actool.Errorf("evidence 最多 20000 个字符"), nil
@@ -206,6 +251,36 @@ func (s *Server) seedVerifierAgent() {
 		log.Printf("[verifier] 创建经验触发器失败: %v", err)
 	}
 	log.Printf("[verifier] 已预置「漏洞验证」agent + finding/经验两个触发器")
+}
+
+// upgradeVerifierTriggerMessage refreshes the verifier's trigger wording in databases
+// seeded before trigger runs carried a finding scope. seedVerifierAgent is guarded by
+// verifier_agent_seed_v1 and only writes the trigger when it creates the agent, so an
+// upgraded database keeps the old text — which now describes a global worklist the
+// tools no longer allow. One-shot, and only rewrites wording that is still verbatim
+// the old default (a user-edited message is left alone).
+func (s *Server) upgradeVerifierTriggerMessage() {
+	const flag = "verifier_trigger_scope_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 只尝试一次
+	triggers, err := s.m.pg.ListTriggersFor(db.VerifierAgentKey)
+	if err != nil {
+		log.Printf("[verifier] 读取触发器失败: %v", err)
+		return
+	}
+	for _, t := range triggers {
+		if !t.OnToolCall || t.ToolCallMessage != verifierToolCallMessageV1 {
+			continue // 用户改过，或不是 finding 触发器，不动。
+		}
+		t.ToolCallMessage = verifierToolCallMessage
+		if err := s.m.pg.UpdateTrigger(t); err != nil {
+			log.Printf("[verifier] 升级触发消息失败: %v", err)
+			return
+		}
+		log.Printf("[verifier] 触发消息已升级为「本次运行绑定在一条漏洞上」")
+	}
 }
 
 // listFindingVerifications exposes the audit trail: what was verified, by whom, and

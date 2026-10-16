@@ -173,3 +173,64 @@ func TestValidVerificationVerdict(t *testing.T) {
 		}
 	}
 }
+
+// TestLegacyPendingFindingIsVerifiable is the regression test for an upgrade deadlock.
+// `pending` is the schema default on findings.status, so every finding written before the
+// candidate state existed carries it. requireVerifiedFinding refuses anything that is not
+// confirmed, so if the worklist and the promotion both understood only `candidate`, an
+// upgraded database would hold findings that can never be handed to the verifier and can
+// never be promoted — and any task whose goal evidence predates the upgrade could never
+// complete again.
+func TestLegacyPendingFindingIsVerifiable(t *testing.T) {
+	d, fid := verificationDB(t)
+	ctx := context.Background()
+
+	// Put the row where a pre-upgrade finding lives.
+	if _, err := d.SetFindingStatus(fid, FindingPending); err != nil {
+		t.Fatal(err)
+	}
+	if !UnadjudicatedStatus(FindingPending) {
+		t.Fatal("pending must count as unadjudicated — it is the schema default, not a human verdict")
+	}
+
+	listed, err := d.CandidateFindings(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen bool
+	for _, f := range listed {
+		if f.ID == fid {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("pending finding %d missing from the verifier worklist — "+
+			"it would never be verified and its goal never provable", fid)
+	}
+
+	if err := d.RecordFindingVerification(ctx, fid, VerdictConfirmed, "独立复现成功", "换入口复现，回显一致", "verifier", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusOf(t, d, fid); got != FindingConfirmed {
+		t.Fatalf("confirmed verdict on a pending finding left status = %q, want %q", got, FindingConfirmed)
+	}
+}
+
+// TestUnadjudicatedStatusExcludesHumanVerdicts pins the other half: widening the worklist
+// to `pending` must not have widened it to states a human deliberately set. A verification
+// that could overwrite `false_positive` would silently resurrect a finding someone judged.
+func TestUnadjudicatedStatusExcludesHumanVerdicts(t *testing.T) {
+	for _, s := range []string{FindingCandidate, FindingPending} {
+		if !UnadjudicatedStatus(s) {
+			t.Errorf("%q should be unadjudicated", s)
+		}
+	}
+	for _, s := range []string{
+		"", FindingInProgress, FindingConfirmed, FindingResolved, FindingFixed,
+		FindingFalsePositive, FindingIgnored, FindingDuplicate, FindingRiskAccepted,
+	} {
+		if UnadjudicatedStatus(s) {
+			t.Errorf("%q should NOT be unadjudicated — it is a deliberate judgement", s)
+		}
+	}
+}

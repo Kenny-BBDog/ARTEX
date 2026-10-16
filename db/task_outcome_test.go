@@ -410,6 +410,53 @@ SELECT id, 'confirmed', 'late', 'late', 'verifier', now() FROM findings WHERE ta
 	}
 }
 
+// TestTasksNeedingOutcomeRecomputesAfterDirectFindingEdit is the regression test for the
+// other way an outcome goes stale. Late adjudication is covered above; this one writes no
+// verification and no retest at all — a human PATCHes a finding's status from the findings
+// page. That changes findings_confirmed / findings_false_positive and the severity totals,
+// so the stored row is wrong, and on a finished task nothing else ever comes along to
+// notice. findings.updated_at is the edge that catches it, and it is maintained by a
+// trigger so that no write path — present or future — can forget to bump it.
+func TestTasksNeedingOutcomeRecomputesAfterDirectFindingEdit(t *testing.T) {
+	d, task := outcomeFixture(t)
+	ctx := context.Background()
+
+	o, err := d.ComputeTaskOutcome(ctx, task.ID)
+	if err != nil || o == nil {
+		t.Fatalf("compute: %+v err=%v", o, err)
+	}
+	o.ComputedAt = time.Now()
+	if err := d.UpsertTaskOutcome(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := d.TasksNeedingOutcome(0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsID(ids, task.ID) {
+		t.Fatal("a freshly computed outcome was re-selected before anything changed")
+	}
+
+	// A triage edit on the findings page: one still-open finding becomes a false positive.
+	var fid int64
+	if err := d.QueryRow(`SELECT id FROM findings WHERE task_id=$1 AND status=$2 LIMIT 1`,
+		task.ID, FindingCandidate).Scan(&fid); err != nil {
+		t.Fatalf("pick a candidate finding: %v", err)
+	}
+	if _, found, _, err := d.SetFindingStatusWithNotify(ctx, fid, FindingFalsePositive); err != nil || !found {
+		t.Fatalf("SetFindingStatusWithNotify: found=%v err=%v", found, err)
+	}
+
+	ids, err = d.TasksNeedingOutcome(0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsID(ids, task.ID) {
+		t.Fatal("an outcome older than a direct finding edit was not re-selected — " +
+			"the metrics would keep the pre-edit counts forever")
+	}
+}
+
 func TestListTaskOutcomesFiltersByStatus(t *testing.T) {
 	d, task := outcomeFixture(t)
 	ctx := context.Background()

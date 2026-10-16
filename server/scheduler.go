@@ -357,14 +357,48 @@ func (sc *Scheduler) fireToolCalls(triggers []*db.AgentTrigger) {
 		}
 		msgCtx := fmt.Sprintf("\n\n【本次由工具调用触发】\n工具: %s\n入参: %s\n返回: %s%s",
 			e.Tool, trunc(e.ToolInput, 1500), errTag, trunc(e.ToolOutput, 1500))
+		// report_finding 的返回里带着刚登记的那条漏洞的 finding_id。把它作为作用域
+		// 传给这次触发：verifier 由此只可能读到、写到自己这一条，而不是靠它在全局
+		// 候选列表里"挑一条"——多个任务并发登记时，那种挑法会把 B 任务的漏洞认成
+		// A 任务的验证结论。
+		scopedFinding := int64(0)
+		if e.Tool == "report_finding" {
+			scopedFinding = findingIDFromReportOutput(e.ToolOutput)
+		}
 		for _, tr := range want {
 			if !containsFold(tr.ToolNames, e.Tool) {
 				continue
 			}
-			sc.s.StartTriggeredRun(tr.AgentKey, fmt.Sprintf("工具触发 · %s · task#%d", e.Tool, e.TaskID), tr.ToolCallMessage+msgCtx, e.TaskID, true, e.TaskDesc, e.TaskGoal)
+			sc.s.StartTriggeredRunScoped(tr.AgentKey, fmt.Sprintf("工具触发 · %s · task#%d", e.Tool, e.TaskID), tr.ToolCallMessage+msgCtx, e.TaskID, scopedFinding, true, e.TaskDesc, e.TaskGoal)
 		}
 	}
 	_ = sc.pg.SetSchedState(schedKeyLastToolCall, strconv.FormatInt(maxID, 10))
+}
+
+// findingIDFromReportOutput pulls the standalone finding id out of a report_finding
+// tool result. The result is a human first line followed by the JSON payload:
+//
+//	finding recorded: <node id>
+//	{"finding_id":"<id>", ...}
+//
+// Two traps. The number on the human line is the EXPLORATION NODE id — a different
+// handle, the one update_finding_report takes — so it is deliberately not what this
+// reads. And RecordedFinding tags FindingID `json:"finding_id,string"`, so the payload
+// carries the id as a quoted string; decoding it into a plain int64 fails silently and
+// drops the scope. Returns 0 for anything it cannot parse, which leaves the fire
+// unscoped rather than binding it to a wrong id.
+func findingIDFromReportOutput(out string) int64 {
+	i := strings.IndexByte(out, '\n')
+	if i < 0 {
+		return 0
+	}
+	var payload struct {
+		FindingID int64 `json:"finding_id,string"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out[i+1:])), &payload); err != nil {
+		return 0
+	}
+	return payload.FindingID
 }
 
 // containsFold reports whether name is in set (case-insensitive).

@@ -148,6 +148,11 @@ type triggeredRun struct {
 	taskDesc  string // 任务描述(任务级,同任务相同);合并时只渲染一次
 	taskGoal  string // 任务目标(任务级,同任务相同);合并时只渲染一次
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
+	// findingID 是本次触发【为哪一个漏洞】而发：report_finding 触发器从工具返回里
+	// 解出该次登记的 finding_id 带进来，run 的 ctx 随之带上同一个作用域，verifier
+	// 的读写工具便只能落在这一条上。0 = 未限定(record_fact 等非 finding 触发)。
+	// 带作用域的 run 不参与合并——合并会把多条 finding 揉进一次运行，绑定随即失效。
+	findingID int64
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {

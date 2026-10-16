@@ -46,16 +46,18 @@ type FindingVerification struct {
 }
 
 // RecordFindingVerification appends one verification record for findingID and, when
-// the verdict is VerdictConfirmed, promotes the finding from FindingCandidate to
-// FindingConfirmed in the same transaction (through SetFindingStatusTx, so status
-// -change notifications fire exactly as they do for a human triage edit).
+// the verdict is VerdictConfirmed, promotes the finding to FindingConfirmed in the same
+// transaction (through SetFindingStatusTx, so status-change notifications fire exactly
+// as they do for a human triage edit).
 //
-// Only a `candidate` is promoted. If a human has already triaged the finding into any
-// other state (false_positive, ignored, …), their decision stands — the verification is
-// still recorded, it just does not overwrite a deliberate judgement. Likewise, only
-// `confirmed` ever writes a status: an `unverified` or `inconclusive` verdict leaves the
-// finding as a candidate rather than asserting "false positive", which is a triage call
-// the system should not be making on its own.
+// Promotion is from any unadjudicated state — see UnadjudicatedStatus, which is
+// `candidate` plus the `pending` schema default that every pre-upgrade finding carries.
+// If a human has already triaged the finding into any other state (false_positive,
+// ignored, …), their decision stands — the verification is still recorded, it just does
+// not overwrite a deliberate judgement. Likewise, only `confirmed` ever writes a status:
+// an `unverified` or `inconclusive` verdict leaves the finding where it was rather than
+// asserting "false positive", which is a triage call the system should not be making on
+// its own.
 func (d *DB) RecordFindingVerification(ctx context.Context, findingID int64, verdict, summary, evidence, agent string, conversationID *int64) error {
 	if findingID <= 0 {
 		return errors.New("finding_id 必填")
@@ -89,7 +91,7 @@ VALUES($1,$2,$3,$4,$5,$6)`, findingID, verdict, summary, evidence, agent, conver
 		return err
 	}
 
-	if verdict == VerdictConfirmed && current == FindingCandidate {
+	if verdict == VerdictConfirmed && UnadjudicatedStatus(current) {
 		if _, _, _, _, err := SetFindingStatusTx(ctx, tx, findingID, FindingConfirmed); err != nil {
 			return err
 		}
@@ -116,15 +118,36 @@ FROM finding_verifications WHERE finding_id=$1 ORDER BY id DESC`, findingID)
 	return out, rows.Err()
 }
 
+// UnadjudicatedStatus reports whether a finding is still waiting for someone other than
+// its reporter to judge it: the verifier's worklist, and the only states a `confirmed`
+// verdict is allowed to promote.
+//
+// FindingPending belongs here because it is the schema default. Every finding written
+// before the candidate state existed is `pending`, and requireVerifiedFinding refuses
+// anything that is not `confirmed` — so a worklist of `candidate` alone would strand
+// every pre-upgrade finding: never handed to the verifier, never promotable, and its
+// task's goal permanently unprovable. The alternative — treating `pending` as already
+// adjudicated and letting it through the gate — would be worse: it would let every
+// legacy finding prove a goal with no independent reproduction at all, which is the
+// exact thing this layer exists to stop.
+//
+// Everything else (in_progress, resolved, fixed, false_positive, ignored, duplicate,
+// risk_accepted) is a deliberate judgement by a human or a downstream process, and a
+// verification must not overwrite it.
+func UnadjudicatedStatus(status string) bool {
+	return status == FindingCandidate || status == FindingPending
+}
+
 // CandidateFindings lists findings still awaiting verification, newest first — the
-// worklist the verifier agent reads to find what it was triggered for.
+// worklist the verifier agent reads to find what it was triggered for. Scoped to one
+// finding by the caller when the trigger carried one (see server's trigger scope).
 func (d *DB) CandidateFindings(limit int) ([]*DBFinding, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
 	rows, err := d.Query(`SELECT `+findingSelectCols+`
 FROM findings f LEFT JOIN tasks t ON t.id = f.task_id
-WHERE f.status=$1 ORDER BY f.id DESC LIMIT $2`, FindingCandidate, limit)
+WHERE f.status IN ($1,$2) ORDER BY f.id DESC LIMIT $3`, FindingCandidate, FindingPending, limit)
 	if err != nil {
 		return nil, err
 	}

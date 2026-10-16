@@ -407,6 +407,12 @@ LIMIT $2`, status, limit)
 // that is what keeps the confirmed count from freezing below the truth forever. This
 // converges: each verification is written once, so once computed_at is past the newest
 // one the task stops being selected.
+//
+// findings.updated_at is the third edge, and the one neither adjudication table covers:
+// a human PATCHing a finding's status or severity changes findings_confirmed,
+// findings_false_positive and the severity totals while writing no verification and no
+// retest. Without it the row keeps its pre-edit numbers until some unrelated
+// adjudication happens to arrive — which, on a finished task, is never.
 func (d *DB) TasksNeedingOutcome(grace time.Duration, limit int) ([]int64, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -425,7 +431,9 @@ WHERE task.deleted_at IS NULL
         COALESCE((SELECT max(v.created_at) FROM finding_verifications v
                   JOIN findings f ON f.id = v.finding_id WHERE f.task_id = task.id), 'epoch'::timestamptz),
         COALESCE((SELECT max(r.created_at) FROM finding_retests r
-                  JOIN findings f2 ON f2.id = r.finding_id WHERE f2.task_id = task.id), 'epoch'::timestamptz)
+                  JOIN findings f2 ON f2.id = r.finding_id WHERE f2.task_id = task.id), 'epoch'::timestamptz),
+        COALESCE((SELECT max(f3.updated_at) FROM findings f3
+                  WHERE f3.task_id = task.id), 'epoch'::timestamptz)
       ))
 ORDER BY task.completed_at
 LIMIT $2`, cutoff, limit)

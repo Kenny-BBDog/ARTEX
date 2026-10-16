@@ -477,16 +477,28 @@ func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMe
 // fire-and-forget chat path; the P3 trigger queue calls it directly so it can wait
 // for completion before starting the next queued fire for the same agent.
 func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
-	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
+	s.runConversationSyncScoped(c, msg, busyKey, 0)
+}
+
+// runConversationSyncScoped is runConversationSync with the triggering finding, when
+// there is one, carried into the run's context so the tools running inside it can
+// enforce that scope.
+func (s *Server) runConversationSyncScoped(c *db.Conversation, msg, busyKey string, findingID int64) {
+	ctx, cancel := s.conversationRunContextScoped(c.ID, busyKey, findingID)
 	s.runConversationTurn(ctx, cancel, c, msg, busyKey)
 }
 
 // Register cancellation before returning 202, so an immediate stop/delete cannot
 // miss a background goroutine which has not started yet.
 func (s *Server) conversationRunContext(id int64, busyKey string) (context.Context, context.CancelCauseFunc) {
+	return s.conversationRunContextScoped(id, busyKey, 0)
+}
+
+func (s *Server) conversationRunContextScoped(id int64, busyKey string, findingID int64) (context.Context, context.CancelCauseFunc) {
 	// Per-run cancellable context so a manual stop (pgStopConversation) can abort
 	// just this session. Registered under chatMu so the stop handler can find it.
 	ctx, cancel := context.WithCancelCause(intercept.WithConvID(s.ctx, id))
+	ctx = intercept.WithTriggerFinding(ctx, findingID)
 	s.chatMu.Lock()
 	s.chatCancel[busyKey] = cancel
 	s.chatMu.Unlock()
@@ -608,13 +620,20 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 // merging by task / all / none); parallel → run each fire in its own concurrent
 // conversation up to trigger_max_parallel. Distinct agents always run concurrently.
 func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string) {
+	s.StartTriggeredRunScoped(agentKey, title, message, taskID, 0, mergeable, taskDesc, taskGoal)
+}
+
+// StartTriggeredRunScoped is StartTriggeredRun plus the finding this fire is about.
+// findingID > 0 binds the run's tools to that one finding (see triggeredRun.findingID);
+// 0 behaves exactly like StartTriggeredRun.
+func (s *Server) StartTriggeredRunScoped(agentKey, title, message string, taskID, findingID int64, mergeable bool, taskDesc, taskGoal string) {
 	if s.m.pg == nil || s.chatAgentRef() == nil {
 		return
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
 	s.queueMu.Lock()
 	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable, findingID: findingID})
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
 }
@@ -673,19 +692,31 @@ func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredR
 		return q[0]
 	}
 	if cfg.mergeMode == "all" {
+		// 带 finding 作用域的 run 绝不合并：合并会把多条 finding 揉进同一次运行，
+		// 而 verifier 的读写工具只认一个作用域，绑定随即失效。它们各自单独跑。
+		for i, it := range q {
+			if it.findingID > 0 {
+				rest := make([]triggeredRun, 0, len(q)-1)
+				rest = append(rest, q[:i]...)
+				rest = append(rest, q[i+1:]...)
+				s.triggerQ[agentKey] = rest
+				return it
+			}
+		}
 		s.triggerQ[agentKey] = q[:0:0]
 		return mergeAllRuns(q)
 	}
-	// by_task: head + same-task mergeable fires.
+	// by_task: head + same-task mergeable fires. A finding-scoped head is never
+	// mergeable — its scope names exactly one finding, and a merged run cannot.
 	head := q[0]
-	if !head.mergeable || head.taskID == 0 {
+	if !head.mergeable || head.taskID == 0 || head.findingID > 0 {
 		s.triggerQ[agentKey] = q[1:]
 		return head
 	}
 	group := []triggeredRun{head}
 	rest := q[:0:0] // keep non-matching items in order
 	for _, it := range q[1:] {
-		if it.mergeable && it.taskID == head.taskID {
+		if it.mergeable && it.findingID == 0 && it.taskID == head.taskID {
 			group = append(group, it)
 		} else {
 			rest = append(rest, it)
@@ -815,7 +846,7 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
-	s.runConversationSync(c, msg, busyKey)
+	s.runConversationSyncScoped(c, msg, busyKey, item.findingID)
 }
 
 // firstLine returns a single-line, length-capped preview (shared with summaries).

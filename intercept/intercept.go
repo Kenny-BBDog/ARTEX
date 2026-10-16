@@ -43,6 +43,29 @@ func ConvIDFromContext(ctx context.Context) int64 {
 	return v
 }
 
+// TriggerFindingKey carries the finding a triggered run was fired FOR. It is a
+// scope, not a hint: a trigger raised by report_finding names exactly one finding,
+// and the tools that run inside that conversation must neither read nor write past
+// it (see server.findingVerificationTools).
+const TriggerFindingKey ctxKey = 1
+
+// WithTriggerFinding scopes a triggered run to one finding. A non-positive id is a
+// no-op, so callers can pass the result of a lookup that found nothing and get an
+// unscoped context back rather than a zero-valued one.
+func WithTriggerFinding(ctx context.Context, findingID int64) context.Context {
+	if findingID <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, TriggerFindingKey, findingID)
+}
+
+// TriggerFindingFromContext extracts the finding a run was triggered for (0 when
+// the run is not finding-scoped).
+func TriggerFindingFromContext(ctx context.Context) int64 {
+	v, _ := ctx.Value(TriggerFindingKey).(int64)
+	return v
+}
+
 // taskCtxKey is a separate unexported key type for task context values.
 type taskCtxKey int
 

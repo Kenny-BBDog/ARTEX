@@ -1270,6 +1270,24 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
 
+-- 漏洞行的「最后一次被改动」时刻。task_outcome 的失效判据要拿它当上界：终态任务出完
+-- 结果之后，人仍然可以在漏洞页 PATCH 状态或严重度，那会改掉 findings_confirmed /
+-- findings_false_positive 与严重度分布，却不会产生任何验证行或复测行——只看那两类
+-- 时间戳的旧判据会漏掉这次改动，实验指标就永久停在旧值上（见 TasksNeedingOutcome）。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- 用触发器而不是在每条 UPDATE 语句里补 updated_at：改漏洞的路径不止一条（状态、
+-- 严重度、名称、类目、证据版本、报告……），漏掉任何一条都会让结果重新沉默地过期，
+-- 而这正是要修的那个 bug。触发器在库这一层兜住，将来新增的写路径也自动覆盖。
+CREATE OR REPLACE FUNCTION findings_touch_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_findings_touch_updated_at ON findings;
+CREATE TRIGGER trg_findings_touch_updated_at BEFORE UPDATE ON findings
+    FOR EACH ROW EXECUTE FUNCTION findings_touch_updated_at();
+
 -- 独立验证记录：worker 自报的漏洞（findings.status='candidate'）经 verifier agent
 -- 用**与首次不同的路径/独立命令**复现后的结论。追加式日志——每完成一次验证写一行，
 -- 不设 pending/running 状态、也无需重启恢复（工作进行中的单位是会话，由调度器管）。
