@@ -1056,6 +1056,9 @@ export interface LLMProfile {
   // 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
   // ""=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
   session_header_key?: string;
+  // OpenCode 免费档开关：true 时按该网关要求发头（固定 opencode UA +
+  // x-opencode-session/-id 一对），并在请求体补一个小写 read 工具。默认 false。
+  opencode_free?: boolean;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
 }

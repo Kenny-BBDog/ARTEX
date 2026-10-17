@@ -348,6 +348,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.OpencodeFree = p.OpencodeFree
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -521,6 +522,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.OpencodeFree = p.OpencodeFree
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -1432,6 +1434,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		// OpencodeFree 用指针做三态：nil=表单没带，回落到指定 profile 存的值；true/false=
+		// 按表单来。缺了它，带该开关的 profile 会"对话通、点测试 403"。
+		OpencodeFree *bool `json:"opencode_free"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1451,16 +1456,24 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	// OpenCode 免费档的开关同理：测试路径必须按该 profile 的取值发那套头，否则会
+	// "对话通、点测试却 403 FreeTierError"。表单带了就按表单，没带则回落到 profile。
+	if req.OpencodeFree != nil {
+		cfg.OpencodeFree = *req.OpencodeFree
+	}
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
-	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	// 会话头名与 opencode 开关同理：表单未带时用已存 profile 的值兜底。
+	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "" || req.OpencodeFree == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
+			}
+			if req.OpencodeFree == nil {
+				cfg.OpencodeFree = p.OpencodeFree
 			}
 		}
 	}
