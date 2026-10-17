@@ -134,7 +134,13 @@ WHERE id=$1`, archiveID, ArchiveReady, archivePath, sha256, originalSize, compre
 		string(countsRaw), string(statsRaw), snapshot.FormatVersion); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Archiving drops this exploration's nodes/edges, so any cached snapshot of it
+	// must be discarded.
+	bumpGraphByExp(expID)
+	return nil
 }
 
 // RestoreTaskArchive restores PostgreSQL rows from a verified manifest. It is
@@ -298,7 +304,12 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	if _, err := tx.Exec(`UPDATE task_archives SET warnings=$2,phase='database_restored',progress=85,error='' WHERE id=$1`, archiveID, string(warningsRaw)); err != nil {
 		return nil, err
 	}
-	return warnings, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	// The restore re-inserted this exploration's nodes/edges.
+	bumpGraphByExp(expID)
+	return warnings, nil
 }
 
 func restoreExplorationStub(tx *sql.Tx, raw json.RawMessage, expID int64) error {

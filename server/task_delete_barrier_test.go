@@ -103,7 +103,7 @@ func TestDeletingRunningTaskKeepsConcurrencySlotUntilCommit(t *testing.T) {
 }
 
 func TestTaskLifecycleRechecksDeleteBarrierAfterConcLock(t *testing.T) {
-	task := &Task{ID: "42", notify: make(chan struct{}, 1)}
+	task := &Task{ID: "42", notify: make(chan struct{}, 1), workerNotify: make(chan struct{}, 1)}
 	m := &Manager{tasks: map[string]*Task{task.ID: task}}
 	s := &Server{m: m, engine: NewEngine(m)}
 

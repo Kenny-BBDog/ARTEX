@@ -110,7 +110,7 @@ func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed
 	if err != nil {
 		return
 	}
-	g, _, err := loadColdGraph(ts)
+	g, _, err := loadColdGraphCached(ts)
 	if err != nil {
 		return
 	}
@@ -150,7 +150,7 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if err != nil {
 		return
 	}
-	g, nodeByID, err := loadColdGraph(ts)
+	g, nodeByID, err := loadColdGraphCached(ts)
 	if err != nil {
 		return
 	}
@@ -197,7 +197,7 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	if err != nil {
 		return
 	}
-	g, nodeByID, err := loadColdGraph(ts)
+	g, nodeByID, err := loadColdGraphCached(ts)
 	if err != nil {
 		return
 	}
@@ -260,7 +260,7 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 		return
 	}
 	// Re-read fresh state and drop any member that revived while we compressed.
-	fresh, _, err := loadColdGraph(ts)
+	fresh, _, err := loadColdGraphCached(ts)
 	if err != nil {
 		return
 	}

@@ -275,6 +275,7 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if err := pg.SeedPromptIfEmpty(a.ID, agent.DefaultAssistantPrompt); err != nil {
 		log.Printf("[agents] seed starter prompt for %s 失败: %v", a.Key, err)
 	}
+	s.invalidateTaskAgents()
 	writeJSON(w, 200, agentDTO(a))
 }
 
@@ -326,6 +327,8 @@ func (s *Server) pgDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	if err := pg.DeleteTriggersForAgent(a.Key); err != nil {
 		log.Printf("[agents] 清理 %s 触发器失败: %v", a.Key, err)
 	}
+	// Drop cached provider bundles and agent→profile bindings for the removed key.
+	s.invalidateTaskAgents()
 	writeJSON(w, 200, map[string]any{"deleted": a.Key})
 }
 
@@ -1801,6 +1804,10 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		db.LLMProfile
 		APIKey    string `json:"api_key"`
 		Streaming *bool  `json:"streaming"`
+		// OpencodeFree 也走指针：这个开关的零值(false)是「关」，若像 Streaming 那样直接用
+		// 内嵌零值，任何一次不带该字段的表单提交(旧前端、局部 patch)都会把它悄悄关掉，
+		// 表现为配置看着没动、请求却开始 403。字段缺省 = 保留库里的值。
+		OpencodeFree *bool `json:"opencode_free"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1809,6 +1816,13 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	if body.OpencodeFree != nil {
+		p.OpencodeFree = *body.OpencodeFree
+	} else if p.ID != 0 {
+		if cur, err := pg.ProfileByID(p.ID); err == nil && cur != nil {
+			p.OpencodeFree = cur.OpencodeFree
+		}
+	}
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
@@ -1912,6 +1926,8 @@ func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
 					}
 				}
 				task.Notify()
+				// Intents were just reopened to 'open' — wake the pool to claim them.
+				task.NotifyWorker()
 			}
 		}
 	}

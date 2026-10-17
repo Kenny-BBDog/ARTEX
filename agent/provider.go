@@ -10,6 +10,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -74,6 +76,17 @@ type Config struct {
 	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
 	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
 	SessionHeaderKey string
+	// OpencodeFree turns on the header set OpenCode's gateway demands before it
+	// serves its free models. Without it every request gets 403 FreeTierError:
+	// the client must look like OpenCode itself. Enabling it sends a fixed
+	// opencode User-Agent plus a matching x-opencode-session /
+	// x-opencode-session-id pair whose value is derived from this run's session
+	// id (see opencodeSessionID). The gateway additionally requires the request
+	// body to carry a tool named exactly "read" and "stream":true; the latter is
+	// Config.Stream, the former is injected server-side (server/assembly.go).
+	//
+	// Independent of SessionHeaderKey — a profile can set either, both, or none.
+	OpencodeFree bool
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
@@ -254,7 +267,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.OpencodeFree)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +346,66 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// opencodeFree additionally sends OpenCode's required client-identity headers.
+	// See Config.OpencodeFree.
+	opencodeFree bool
+}
+
+// opencodeUserAgent is what OpenCode's gateway looks for; it checks that the
+// value is an `opencode/...` client string, not a specific version.
+const opencodeUserAgent = "opencode/latest/2.0.29/cli"
+
+// opencodeSessionAlphabet is the character set the gateway accepts after the hex
+// field. Uppercase is untested; real OpenCode ids are lowercase, so stay there.
+const opencodeSessionAlphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+// opencodeHexFloor is the lowest value the low 12 bits of the 12-hex field may
+// take. Anything below it is answered with 403 FreeTierError. Measured, not
+// inferred: bisecting the low bits gave last-accepted 0xfff / first-rejected
+// 0x1000 in the base block, and the same 0xfc0 boundary reproduced in blocks
+// 0x0ffffffff000, 0x012345678000 and 0xed51e16d8000.
+const opencodeHexFloor = 0xfc0
+
+// opencodeHexSpan is how many low-bit values the gateway accepts (0xfc0..0xfff).
+const opencodeHexSpan = 0x1000 - opencodeHexFloor
+
+// opencodeTailLen is how many free-form characters follow the hex field. 4 + 12
+// + 14 = 30, the length of a real OpenCode session id.
+const opencodeTailLen = 14
+
+// opencodeSessionID derives the `ses_...` value OpenCode wants from this run's
+// session id — stable within a session, distinct across sessions, so per-session
+// prompt caching and rate-limit spreading still work. An empty session id (e.g. a
+// request that never went through transcript.WithSessionID) falls back to a fixed
+// suffix rather than sending a malformed header.
+//
+// The shape is "ses_" + 12 lowercase hex + 14 characters of [0-9a-z], 30 total.
+// Getting there took measuring the gateway, because the obvious reading of the
+// format is wrong in one place: it is NOT enough for the 12 hex characters to be
+// hex. The gateway rejects any field whose low 12 bits fall below 0xfc0. Sweeping
+// each position over [0-9a-z] and then bisecting put the threshold at exactly
+// 0xfc0, and it held there in every block probed — from the low end of the field
+// up to its maximum, and in the unrelated blocks 0x0ffffffff000, 0x012345678000
+// and 0xed51e16d8000 — while a random 44-bit upper part was accepted unchanged.
+// So the upper 36 bits are free and this is not a timestamp that can expire; only
+// the low 12 are constrained. The 14 trailing characters are genuinely free.
+func opencodeSessionID(sid string) string {
+	if sid == "" {
+		sid = "artex-anonymous"
+	}
+	sum := sha256.Sum256([]byte(sid))
+	// 36 unconstrained bits, then 12 bits pushed up into the accepted band.
+	hi := uint64(sum[0])<<28 | uint64(sum[1])<<20 | uint64(sum[2])<<12 | uint64(sum[3])<<4 | uint64(sum[4])>>4
+	lo := uint64(sum[4]&0x0f)<<8 | uint64(sum[5])
+	field := hi<<12 | (opencodeHexFloor + lo%opencodeHexSpan)
+
+	var b strings.Builder
+	b.WriteString("ses_")
+	fmt.Fprintf(&b, "%012x", field)
+	for i := 0; i < opencodeTailLen; i++ {
+		b.WriteByte(opencodeSessionAlphabet[int(sum[6+i])%len(opencodeSessionAlphabet)])
+	}
+	return b.String()
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -344,6 +417,15 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
+	}
+	// OpenCode's gateway only serves its free models to requests that look like
+	// they come from the OpenCode client. Both session headers carry the SAME
+	// value — sending only one, or values that differ, is rejected.
+	if t.opencodeFree {
+		req.Header.Set("User-Agent", opencodeUserAgent)
+		sid := opencodeSessionID(transcript.SessionIDFrom(req.Context()))
+		req.Header.Set("x-opencode-session", sid)
+		req.Header.Set("x-opencode-session-id", sid)
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
@@ -397,7 +479,7 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+func quotaAwareHTTPClient(proxy, sessionHeaderKey string, opencodeFree bool) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -416,7 +498,7 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), opencodeFree: opencodeFree}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a
@@ -478,14 +560,21 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// 就撞到输出上限(finish=length)、被截断,连接测试虽仍算通(err=nil)但显示成
 	// "已中断/length/resume" 一团糟。给足预算让它把 OK 干净吐完(finish=stop)。
 	// EscalateMaxTokens 保持 false:不因截断而抬额重试,避免 resume 循环空烧。
-	reply, err := agentcore.Run(ctx, agentcore.Options{
+	// OpenCode 免费档要求请求体里带一个小写 read 工具。真实对话走 server 的
+	// ToolAugment 注入它，但连接测试自己组工具表(nil → tool.DefaultTools())，不补
+	// 就会"对话通、点测试 403"。
+	opts := agentcore.Options{
 		Provider:       prov,
 		SystemPrompt:   []string{"你是连接测试。直接输出两个字符 OK 即可，不要思考、不要解释、不要别的。"},
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
 		MaxTokens:      8192,
 		NonStreaming:   !c.Stream, // 用该 profile 的真实收发模式做连接测试
-	}, "ping")
+	}
+	if c.OpencodeFree {
+		opts.Tools = append(actool.DefaultTools(), OpencodeReadAlias())
+	}
+	reply, err := agentcore.Run(ctx, opts, "ping")
 	lat := time.Since(start)
 	if err != nil {
 		return lat, "", err

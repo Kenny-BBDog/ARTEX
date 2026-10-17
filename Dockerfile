@@ -26,6 +26,11 @@ ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 WORKDIR /src
 COPY go.mod go.sum ./
+# go.mod 里有 `replace github.com/Autumn-27/norma => ./norma`（upstream 闭源后从 module
+# proxy 恢复进仓库的本地模块）。只 COPY go.mod 的话这一步会直接报
+# "reading norma/go.mod: no such file or directory"，所以先把替换目标的 go.mod/go.sum
+# 一起带上；norma 自身的代码仍在后面的 `COPY . .` 进来，这层的缓存也保得住。
+COPY norma/go.mod norma/go.sum ./norma/
 RUN go mod download
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）

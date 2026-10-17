@@ -11,6 +11,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/memory"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -314,6 +315,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
    - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
+   - ⚠️ **收尾前的未触碰面核对**：标记最后一个未完成目标前，先看态势里的 surface 字段——那是【本任务已发现、却从未触碰】的资产数（含少量样例；list_untested_assets 是按范围过滤的另一个视角，范围谓词未必可信，以 surface 为准，它已排除被 open/running 意图认领的资产——那些是在飞、不是你漏掉的）。**若在剩余预算还超过一半、又还有未触碰资产的情况下收尾，系统会拦下 prove_goal 并回一份清单。** 两条出路，二选一：①派意图去覆盖它们（通常才是对的——这些是你自己发现的攻击面）；②判断确实不值得继续（例如已确认无法推进、或与本目标无关），调 accept_untested_surface 说明理由，然后再收官。**放弃是允许的，但必须显式表态**：把已发现的面留在没碰过的状态就宣布完成，与"根本没注意到它们"无法区分，系统一律按后者处理。
 
 3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界：
    - 图里已有 worker 产出的 fact（facts>0 / recent_facts 非空）→【禁止】再自己探测，一切判断基于已有 fact，本轮产物只能是"派新意图"或"结束"；想深挖某线索 → 派意图让 worker 去查，不是自己 curl。
@@ -327,7 +329,8 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
      · **exhausted（预算耗尽、探到一半被掐断，只写回部分）/ blocked（模型或网络失败、基本没探成）**：都是中途没善终、信息不全——先用 get_worker_trace / get_worker_output 看它实际做到哪、卡在哪，再从下列里选：接近突破被预算掐 → 派"接上次进度继续"；纯外部故障没跑成（blocked 常是）→ 直接重派同方向；每次卡同一处 → 换打法/方向。依据永远是 trace 里的真实进度，不是 state 本身。
    - 完全无任何意图覆盖的全新方向 → 生成。
    - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
-   - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
+   - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。**但"优先往深打"不等于可以把自己已发现的面整片晾着**：surface 里还有资产没碰过时，先把它们纳入意图（哪怕只是快速过一遍），再决定收尾——"深"针对的是已选中的路线，不是未选中的资产。
+   - **别把钱剩在手里**：态势里 surface 存在、或仍有未覆盖方向，而时间预算还剩很多时收尾，基本都是错的——那意味着你停在了"还能继续找"的地方。预算是拿来花在攻击面上的。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
 
    **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
@@ -380,6 +383,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
 	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	// 共享大脑 push（planner 侧）：按当前【态势】（任务 goal + 根描述）选经验。
+	// planner 要决定"往哪派"，所以给它的是方向级经验；worker 拿到的是意图级
+	// （见 worker.go 同名注释，两者查询面不同是刻意的）。
+	if goal, desc, _ := ts.Root(); desc != "" || goal != "" {
+		if lessons := injectLessons(memory.NewStore(memoryPath(p.workDir)), desc+" "+goal); lessons != "" {
+			situational += lessons
+		}
+	}
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
@@ -437,6 +448,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		// 共享大脑：跨任务经验按相关性强制注入本轮输入（≤3 条，照 memoryInject 注释）。
+		// planner 的输入是态势文本，Relevant() 天然按当前态势过滤过期经验。
+		Memory: memoryInject(p.workDir),
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

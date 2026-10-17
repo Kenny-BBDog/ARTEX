@@ -15,6 +15,7 @@ import (
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/memory"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -467,6 +468,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		// 共享大脑：跨任务经验按相关性强制注入每轮输入（≤3 条，照 memoryInject 注释）。
+		Memory: memoryInject(w.workDir),
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
@@ -488,6 +491,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	input := overview
 	if strings.TrimSpace(input) == "" {
 		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+	}
+	// 共享大脑的 push 投递：【按本意图】挑选过往观察（不是按全场态势——run 7 实测
+	// 按势态挑选时每场都拿到同样的同目标经验包，与意图错位），进启动 user 消息首拍。
+	if lessons := injectLessons(memory.NewStore(memoryPath(w.workDir)), intentLessonQuery(intent)); lessons != "" {
+		input += lessons
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
@@ -530,6 +538,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
-	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	finalText, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	// 强制写回：收尾词的"把已识别的全部落库"是对模型的劝告，不是保证。这次 run 走完了却一条
+	// 结论都没留下时，由运行时替它补一条，让图上的每一条终态意图都带着内容——
+	// 规划者才分得清「这条是死路」和「这条根本没探成」。已写回时不产生任何节点。
+	runWrapupFact(ctx, ts, intent, name, reason, finalText)
 	return reason, tsx.Writes(), err
 }

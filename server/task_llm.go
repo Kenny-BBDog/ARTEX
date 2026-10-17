@@ -547,6 +547,8 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Lock()
 	s.taskAgents = map[string]*taskAgentBundle{}
 	s.taskAgentMu.Unlock()
+	// Agent bindings feed those bundles, so they go stale together.
+	s.invalidateAgentBindings()
 }
 
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {

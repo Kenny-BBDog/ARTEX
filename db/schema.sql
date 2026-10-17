@@ -163,6 +163,11 @@ CREATE TABLE IF NOT EXISTS explorations (
 -- planner wakes and processes a round. Drives the ≥R cold-node debounce (measured in
 -- this exploration's own rounds, not global node ids or wall-clock).
 ALTER TABLE explorations ADD COLUMN IF NOT EXISTS round_no BIGINT NOT NULL DEFAULT 0;
+
+-- 收尾时的"未触碰面"决定：规划者要么先覆盖掉自己已发现的资产，要么显式说明为什么放弃。
+-- 存的是【决定】，不是覆盖度——目标是强制表态，不是强制覆盖。
+ALTER TABLE explorations ADD COLUMN IF NOT EXISTS surface_waived_reason TEXT;
+ALTER TABLE explorations ADD COLUMN IF NOT EXISTS surface_waived_at     TIMESTAMPTZ;
 DROP TRIGGER IF EXISTS trg_exp_upd ON explorations;
 CREATE TRIGGER trg_exp_upd BEFORE UPDATE ON explorations
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -395,6 +400,10 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- 自定义会话头：非空时每次请求带一个该名字的 HTTP 头，头值=当前运行的 session id
     -- (chat 会话/worker 意图)。用于某些按 session-id 头做提示缓存/粘性路由的网关。''=不发送。
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- OpenCode 免费档开关：true 时按该网关的反滥用要求发头（固定 opencode UA +
+    -- x-opencode-session / x-opencode-session-id 一对），并在请求体补一个小写 read 工具。
+    -- false(默认) = 完全不发，普通网关无副作用。
+    opencode_free BOOLEAN NOT NULL DEFAULT false,
     -- 重试覆盖：次数 0=用全局默认/-1=关闭/>0=该值；间隔 0=用默认指数退避/>0=固定毫秒。
     -- 三组分别对应建连重试、空响应重试、同 provider 安全窗口重试，详见下方 ALTER 处注释。
     retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
@@ -434,6 +443,8 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- 自定义会话头名；补旧库。默认 '' = 不发送，旧配置行为不变。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- OpenCode 免费档开关；补旧库。默认 false = 不改变任何既有行为。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS opencode_free BOOLEAN NOT NULL DEFAULT false;
 
 -- 单配置的重试覆盖（见 docs/LLM重试设计.md）。三组各自一对「次数 + 固定间隔」，
 -- 语义统一：次数 0=沿用全局默认、-1=关闭该层重试、>0=用该值；间隔 0=沿用该层的
@@ -759,6 +770,128 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_task_scope_v2 ON task_scope(
 CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('root_domain','subdomain');
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
+
+-- 每任务一行「跑完成什么样」的汇总，供效果度量（漏洞召回/误报、token 成本、空转率…）
+-- 做跨任务对比。由 server 的调度器在任务进入终态并静置后自动重算，没有人工重算入口。
+--
+-- 口径说明（同一任务用不同来源会得到不同数字，这里只选一个，列出来避免日后误读）：
+--   * token 一律取 llm_usage（按调用记账、成功失败都记、带 model/profile 维度，且任务
+--     冷归档后仍保留），而不是 activity 里 kind='result' 的每-run 汇总行。
+--   * duration_seconds = COALESCE(first_run_at, created_at) → completed_at：取「真正开始跑」
+--     到结束，把排队等待排除在外；first_run_at 为空（从未跑过）时退化为创建时间。
+--   * tool_calls 数的是 activity.kind='tool_use'，tool_errors 数的是 kind='tool_result'
+--     且 is_error 的行——分子分母不是同一批行，但比值仍表示「工具调用失败的密度」。
+--   * idle_turns 数的是 activity.kind='empty_turn'（engine 空转续跑埋点）。
+--   * findings_claimed 是本任务登记的全部漏洞（含未验证）；findings_confirmed 只数
+--     status='confirmed'。两者的差距就是「自报 vs 已验证」——飞轮最想看的信号之一。
+CREATE TABLE IF NOT EXISTS task_outcome (
+    task_id                 BIGINT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    exploration_id          BIGINT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT '',
+    completed_at            TIMESTAMPTZ,
+    computed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    llm_calls               BIGINT  NOT NULL DEFAULT 0,
+    input_tokens            BIGINT  NOT NULL DEFAULT 0,
+    output_tokens           BIGINT  NOT NULL DEFAULT 0,
+    cache_read_tokens       BIGINT  NOT NULL DEFAULT 0,
+    cache_write_tokens      BIGINT  NOT NULL DEFAULT 0,
+
+    goals_total             INTEGER NOT NULL DEFAULT 0,
+    goals_met               INTEGER NOT NULL DEFAULT 0,
+
+    findings_claimed        INTEGER NOT NULL DEFAULT 0,
+    findings_confirmed      INTEGER NOT NULL DEFAULT 0,
+    findings_false_positive INTEGER NOT NULL DEFAULT 0,
+    findings_critical       INTEGER NOT NULL DEFAULT 0,
+    findings_high           INTEGER NOT NULL DEFAULT 0,
+    findings_medium         INTEGER NOT NULL DEFAULT 0,
+    findings_low            INTEGER NOT NULL DEFAULT 0,
+
+    retests_fixed           INTEGER NOT NULL DEFAULT 0,
+
+    coverage_denominator    INTEGER NOT NULL DEFAULT 0,
+    coverage_tested         INTEGER NOT NULL DEFAULT 0,
+    coverage_pct            DOUBLE PRECISION,
+
+    -- reached × claimed 交叉度量。coverage_tested 就是「到过」那一腿；下面几列补上
+    -- 「到过的资产上到底说了什么」。silent_assets = coverage_tested - claimed_assets，
+    -- 即「到了却什么都没说」——假阴性候选，飞轮的主输入。存下来而不是读时推导，因为
+    -- 它是要被对比和追踪的信号。silent_asset_list 是样本（最多 20 条），用于给下一轮
+    -- 派意图、给规划者打分。
+    claimed_assets          INTEGER NOT NULL DEFAULT 0,
+    claimed_confirmed_assets INTEGER NOT NULL DEFAULT 0,
+    silent_assets           INTEGER NOT NULL DEFAULT 0,
+    silent_asset_list       JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
+    -- 交叉度量的【上游】缺口：任务已关联、但自身范围谓词覆盖不到的资产。这些资产根本
+    -- 进不了分母，所以既不算 silent 也不进未测清单——范围漏了，漏报就被一起藏起来了。
+    -- uncovered_agent_assets 单独数出「worker 自己 insert_assets 带进来、却在范围外」的
+    -- 那部分：那是 agent 走出了给它的授权范围（正确性/安全问题），而不是平台记账没跟上。
+    linked_assets           INTEGER NOT NULL DEFAULT 0,
+    uncovered_assets        INTEGER NOT NULL DEFAULT 0,
+    uncovered_agent_assets  INTEGER NOT NULL DEFAULT 0,
+    uncovered_asset_list    JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
+    -- 路线深度：每条路在被 worker 关掉之前究竟被推了多远。夹在「到没到得了」和「结论真不真」
+    -- 之间。系统没有「判死」这个状态——放弃的 worker 是【正常完成】的，所以浅尝辄止在所有
+    -- 其它度量里都读作健康。routes_thin / premature_exhaustion 只统计 done 的意图：exhausted
+    -- 是做得太多、blocked 是报错、stopped 是被外部杀，都不是 worker 自己对路线的判决。
+    -- premature_exhaustion = 没怎么动、零漏洞，却把结论标成 observed（自称手段已穷尽）。
+    routes_terminal         INTEGER NOT NULL DEFAULT 0,
+    routes_done             INTEGER NOT NULL DEFAULT 0,
+    routes_thin             INTEGER NOT NULL DEFAULT 0,
+    routes_yielding         INTEGER NOT NULL DEFAULT 0,
+    facts_inferred          INTEGER NOT NULL DEFAULT 0,
+    facts_observed          INTEGER NOT NULL DEFAULT 0,
+    premature_exhaustion    INTEGER NOT NULL DEFAULT 0,
+    thin_routes             JSONB   NOT NULL DEFAULT '[]'::jsonb,
+
+    -- 预算内广度：这次运行是「做完了」还是「不看了」。late_reach_growth = 后半程新铺开的
+    -- 资产数（用首次锚定时间切分，重复触碰不算新面）。接近 0 表示后半程没开出任何新面——
+    -- 无论看起来多忙。它配合 budget_left_pct 与 uncovered_assets，把「没预算了」和
+    -- 「主动收手」分开。reach_at_midpoint + late_reach_growth == coverage_tested（构造保证）。
+    budget_seconds          BIGINT  NOT NULL DEFAULT 0,
+    budget_left_pct         DOUBLE PRECISION,
+    assets_reached          INTEGER NOT NULL DEFAULT 0,
+    reach_at_midpoint       INTEGER NOT NULL DEFAULT 0,
+    late_reach_growth       INTEGER NOT NULL DEFAULT 0,
+
+    duration_seconds        BIGINT  NOT NULL DEFAULT 0,
+    tool_calls              INTEGER NOT NULL DEFAULT 0,
+    tool_errors             INTEGER NOT NULL DEFAULT 0,
+    idle_turns              INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_task_outcome_completed ON task_outcome(completed_at DESC);
+
+-- reached × claimed 交叉度量（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_assets           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS claimed_confirmed_assets INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_assets            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS silent_asset_list        JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 范围缺口（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS linked_assets            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_assets         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_agent_assets   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS uncovered_asset_list     JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 路线深度（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_terminal        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_done            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_thin            INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS routes_yielding        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_inferred         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS facts_observed         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS premature_exhaustion   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS thin_routes            JSONB   NOT NULL DEFAULT '[]'::jsonb;
+
+-- 预算内广度（旧库升级）
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS budget_seconds        BIGINT  NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS budget_left_pct       DOUBLE PRECISION;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS assets_reached        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS reach_at_midpoint     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_outcome ADD COLUMN IF NOT EXISTS late_reach_growth     INTEGER NOT NULL DEFAULT 0;
 
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录
@@ -1142,6 +1275,42 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+
+-- 漏洞行的「最后一次被改动」时刻。task_outcome 的失效判据要拿它当上界：终态任务出完
+-- 结果之后，人仍然可以在漏洞页 PATCH 状态或严重度，那会改掉 findings_confirmed /
+-- findings_false_positive 与严重度分布，却不会产生任何验证行或复测行——只看那两类
+-- 时间戳的旧判据会漏掉这次改动，实验指标就永久停在旧值上（见 TasksNeedingOutcome）。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- 用触发器而不是在每条 UPDATE 语句里补 updated_at：改漏洞的路径不止一条（状态、
+-- 严重度、名称、类目、证据版本、报告……），漏掉任何一条都会让结果重新沉默地过期，
+-- 而这正是要修的那个 bug。触发器在库这一层兜住，将来新增的写路径也自动覆盖。
+CREATE OR REPLACE FUNCTION findings_touch_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_findings_touch_updated_at ON findings;
+CREATE TRIGGER trg_findings_touch_updated_at BEFORE UPDATE ON findings
+    FOR EACH ROW EXECUTE FUNCTION findings_touch_updated_at();
+
+-- 独立验证记录：worker 自报的漏洞（findings.status='candidate'）经 verifier agent
+-- 用**与首次不同的路径/独立命令**复现后的结论。追加式日志——每完成一次验证写一行，
+-- 不设 pending/running 状态、也无需重启恢复（工作进行中的单位是会话，由调度器管）。
+-- 只有 verdict='confirmed' 会把 findings.status 提升为 confirmed；unverified /
+-- inconclusive 一律保持 candidate，系统从不自动断言「误报」（那是人工处置的语义）。
+CREATE TABLE IF NOT EXISTS finding_verifications (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    verdict TEXT NOT NULL CHECK (verdict IN ('confirmed','unverified','inconclusive')),
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    agent TEXT NOT NULL DEFAULT '',
+    conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_verifications_history ON finding_verifications(finding_id, id DESC);
+
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,

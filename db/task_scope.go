@@ -325,6 +325,268 @@ tested AS (
 
 // TaskCoverage computes rough per-type coverage for a task. taskID indexes
 // task_scope + assets; expID indexes the fact anchors. Reference figure only.
+// covClaimCTE extends covTargetCTE with the two claim-side buckets. Reuses `target` and
+// `tested` so "reached" means exactly what Coverage.Tested means — the two definitions
+// must never drift, or the cross-product would compare apples to oranges.
+//
+// `claimed` keys off finding NODES (the act of asserting); `claimed_confirmed` requires
+// the finding ROW behind that node to have survived verification. Facts and findings are
+// separate anchor sources, so reached and claimed are genuinely independent sets.
+const covClaimCTE = covTargetCTE + `,
+claimed AS (
+  SELECT DISTINCT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes en ON en.id = ea.node_id
+  WHERE en.exploration_id = $2 AND en.kind = 'finding'
+),
+claimed_confirmed AS (
+  SELECT DISTINCT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes en ON en.id = ea.node_id
+  JOIN findings f ON f.node_id = en.id
+  WHERE en.exploration_id = $2 AND en.kind = 'finding' AND f.status = 'confirmed'
+)`
+
+// ClaimCoverage is the cross-product the flywheel turns on: of the in-scope assets we
+// actually reached, how many did we make a claim about — and how many did we walk past
+// in silence?
+//
+// The distinction is the whole point. A false positive (claimed, not upheld) tells you to
+// make the agent quieter; a silent miss (reached, claimed nothing) tells you it failed to
+// SEE — and only the second one makes it stronger. That signal exists only while
+// "reached" and "claimed" are independent records, which is exactly why the exploration
+// graph's node state must not be made to mirror findings.status.
+type ClaimCoverage struct {
+	Scope     int `json:"scope"`     // 范围内资产数（= Coverage.Denominator）
+	Reached   int `json:"reached"`   // 到过：有 fact 锚点（= Coverage.Tested）
+	Claimed   int `json:"claimed"`   // 说了：有 finding 锚点
+	Confirmed int `json:"confirmed"` // 说了且至少一条 finding 已被独立维持
+	// Silent = Reached - Claimed. Assets the agent touched, recorded an observation on,
+	// and then asserted nothing about. The flywheel's headline number.
+	Silent       int             `json:"silent"`
+	SilentAssets []CoverageAsset `json:"silent_assets"` // 上述资产的样本（最多 listLimit 条）
+}
+
+// TaskClaimCoverage computes the reached × claimed cross-product for one task. listLimit
+// caps the returned silent-asset sample (<=0 → 20); Silent is the true count regardless.
+//
+// Assets reached in an earlier run of the same exploration count as reached here, so a
+// resumed task does not look artificially silent.
+func (s *AssetStore) TaskClaimCoverage(taskID, expID int64, listLimit int) (*ClaimCoverage, error) {
+	if listLimit <= 0 {
+		listLimit = 20
+	}
+	out := &ClaimCoverage{SilentAssets: []CoverageAsset{}}
+	err := s.db.QueryRow(`
+WITH `+covClaimCTE+`
+SELECT
+  (SELECT count(*) FROM target),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM tested)),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM claimed)),
+  (SELECT count(*) FROM target t WHERE t.id IN (SELECT asset_id FROM claimed_confirmed)),
+  (SELECT count(*) FROM target t
+    WHERE t.id IN (SELECT asset_id FROM tested)
+      AND t.id NOT IN (SELECT asset_id FROM claimed))`,
+		taskID, expID).Scan(&out.Scope, &out.Reached, &out.Claimed, &out.Confirmed, &out.Silent)
+	if err != nil {
+		return nil, err
+	}
+	if out.Silent == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`
+WITH `+covClaimCTE+`
+SELECT t.id, t.type, t.label FROM target t
+WHERE t.id IN (SELECT asset_id FROM tested)
+  AND t.id NOT IN (SELECT asset_id FROM claimed)
+ORDER BY t.id LIMIT $3`, taskID, expID, listLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a CoverageAsset
+		if err := rows.Scan(&a.ID, &a.Type, &a.Label); err != nil {
+			return nil, err
+		}
+		out.SilentAssets = append(out.SilentAssets, a)
+	}
+	return out, rows.Err()
+}
+
+// ScopeGapAsset is one asset the task linked but its own scope does not cover.
+type ScopeGapAsset struct {
+	ID     int64  `json:"id"`
+	Type   string `json:"type"`
+	Label  string `json:"label"`
+	Source string `json:"source"` // task | agent | system — how the asset got linked
+}
+
+// ScopeGap measures the leak *upstream* of the reached × claimed cross-product: assets
+// the task has taken ownership of that its own scope predicate does not cover.
+//
+// The denominator of every coverage figure comes from task_scope. So an asset outside
+// the scope is not merely "untested" — it is invisible: it never enters the denominator,
+// never counts as a silent miss, and never shows up in the untested backlog. A scope that
+// under-covers therefore suppresses exactly the misses the flywheel is trying to surface,
+// which is why the gap has to be measured on its own.
+//
+// UncoveredAgent is the diagnostic that makes this actionable, because it separates two
+// very different failures:
+//
+//   - gap among task/system-linked assets → the scope bookkeeping failed (the platform
+//     associated an asset and then never scoped it).
+//   - gap among agent-linked assets      → a worker inserted an asset via insert_assets
+//     that its own authorization does not cover. That is the agent reaching outside the
+//     scope it was given, which is a correctness-and-safety signal, not a bookkeeping one.
+//
+// In both cases the asset is genuinely being worked on — it is the scope predicate that
+// disagrees with the asset's shape, not the other way round.
+type ScopeGap struct {
+	Linked          int             `json:"linked"`           // 关联到本任务的资产数（task_asset_links）
+	Uncovered       int             `json:"uncovered"`        // 其中范围谓词覆盖不到的 = 缺口
+	UncoveredAgent  int             `json:"uncovered_agent"`  // 缺口里由 worker insert_assets 带进来的
+	UncoveredAssets []ScopeGapAsset `json:"uncovered_assets"` // 上述资产的样本（最多 listLimit 条）
+}
+
+// TaskBreadth measures how a run spent its budget across the attack surface — the other
+// half of "why didn't we find it".
+//
+// The reach/claim/depth metrics all describe *what* was covered. None of them says whether
+// the run stopped because the work was done or because it stopped looking. A run can end
+// with surface untouched and budget in hand: that is the agent declaring itself finished
+// early, and on a real application — hundreds of endpoints with a handful of bugs hiding
+// among them — that is a likelier way to lose recall than giving up inside any one route.
+//
+// LateReachGrowth is the discriminating number. It is how much new surface the second half
+// of the run opened up. Near zero means the run converged onto a corner of the target and
+// stayed there, however busy it looked; paired with budget_left_pct and the uncovered count
+// it separates "ran out of room" from "chose to stop".
+type TaskBreadth struct {
+	BudgetSeconds int64 `json:"budget_seconds"` // 任务时间预算；0=不限
+	// BudgetLeftPct is the share of the budget left when the run ended. nil when unlimited
+	// — "left over" is meaningless without a denominator.
+	BudgetLeftPct *float64 `json:"budget_left_pct"`
+	// ReachAtMidpoint / LateReachGrowth split AssetsReached at the run's time midpoint.
+	AssetsReached   int `json:"assets_reached"`    // 到过的已发现资产数
+	ReachAtMidpoint int `json:"reach_at_midpoint"` // 前半程新铺开的
+	LateReachGrowth int `json:"late_reach_growth"` // 后半程新增；ReachAtMidpoint+LateReachGrowth == AssetsReached
+}
+
+// TaskBreadth computes the breadth figures for one task.
+//
+// The universe is the assets the task has OWNED (task_asset_links), not the scope-matched
+// denominator Coverage uses. That distinction is deliberate: "did we stop looking while
+// there was still surface" is a question about the surface the agent itself had already
+// found, and every one of those assets was fair game to explore further. Dividing by the
+// authorization denominator instead would make the figure move whenever scope bookkeeping
+// drifted — which it demonstrably does (see TaskScopeGap) — and would understate breadth
+// on exactly the runs that discovered the most.
+//
+// Reached assets are identified by their FIRST anchor time, so re-touching an asset later
+// does not count as new breadth.
+func (s *AssetStore) TaskBreadth(taskID, expID int64) (*TaskBreadth, error) {
+	out := &TaskBreadth{}
+	var usedSeconds int64
+	err := s.db.QueryRow(`
+WITH linked AS (
+  SELECT asset_id FROM task_asset_links WHERE task_id = $1
+),
+-- fact OR finding, matching touchedCTE in task_surface.go: an asset that produced a
+-- finding was plainly worked on even without a separate fact node. Keeping one definition
+-- is what makes AssetsReached here and UntouchedSurface there add up to LinkedAssets.
+reached_at AS (
+  SELECT ea.asset_id, min(n.created_at) AS first_at
+  FROM exploration_anchors ea
+  JOIN exploration_nodes n ON n.id = ea.node_id
+  WHERE n.exploration_id = $2 AND n.kind IN ('fact','finding')
+  GROUP BY ea.asset_id
+),
+bounds AS (
+  SELECT COALESCE(first_run_at, created_at) AS start_at,
+         COALESCE(completed_at, now())      AS end_at,
+         COALESCE(timeout_seconds, 0)       AS budget
+  FROM tasks WHERE id = $1
+)
+SELECT b.budget,
+       -- Scan order is (budget, midpoint, total, used): keep the SELECT in that order so a
+       -- reordering here cannot silently swap two same-typed counts.
+       (SELECT count(*) FROM linked l JOIN reached_at r ON r.asset_id = l.asset_id
+         WHERE r.first_at <= b.start_at + (b.end_at - b.start_at) / 2),
+       (SELECT count(*) FROM linked l JOIN reached_at r ON r.asset_id = l.asset_id),
+       GREATEST(EXTRACT(EPOCH FROM (b.end_at - b.start_at))::bigint, 0)
+FROM bounds b`, taskID, expID).Scan(&out.BudgetSeconds, &out.ReachAtMidpoint, &out.LateReachGrowth, &usedSeconds)
+	if err != nil {
+		return nil, err
+	}
+	// Computed as a difference so ReachAtMidpoint + LateReachGrowth == Reached by
+	// construction. Reached is also AssetsReached on the struct — the linked-but-untouched
+	// remainder is the gap between LinkedAssets and this figure on the same outcome row.
+	out.LateReachGrowth -= out.ReachAtMidpoint
+	out.AssetsReached = out.ReachAtMidpoint + out.LateReachGrowth
+	if out.BudgetSeconds > 0 {
+		left := float64(out.BudgetSeconds-usedSeconds) / float64(out.BudgetSeconds)
+		if left < 0 {
+			left = 0
+		}
+		if left > 1 {
+			left = 1
+		}
+		out.BudgetLeftPct = &left
+	}
+	return out, nil
+}
+
+// TaskScopeGap computes the linked-but-unscoped gap for one task. listLimit caps the
+// sample (<=0 → 20); Uncovered is the true count regardless.
+//
+// "Linked" is task_asset_links, the authoritative task↔asset association (it carries the
+// provenance this metric needs). "Covered" is the same covTargetCTE every coverage figure
+// uses — reusing it is deliberate, so the gap can never disagree with the denominator it
+// is explaining.
+func (s *AssetStore) TaskScopeGap(taskID, expID int64, listLimit int) (*ScopeGap, error) {
+	if listLimit <= 0 {
+		listLimit = 20
+	}
+	out := &ScopeGap{UncoveredAssets: []ScopeGapAsset{}}
+	covered := `EXISTS (SELECT 1 FROM target t WHERE t.id = l.asset_id)`
+	err := s.db.QueryRow(`
+WITH `+covTargetCTE+`,
+linked AS (SELECT asset_id, source FROM task_asset_links WHERE task_id = $1)
+SELECT
+  (SELECT count(*) FROM linked),
+  (SELECT count(*) FROM linked l WHERE NOT `+covered+`),
+  (SELECT count(*) FROM linked l WHERE l.source = 'agent' AND NOT `+covered+`)`,
+		taskID, expID).Scan(&out.Linked, &out.Uncovered, &out.UncoveredAgent)
+	if err != nil {
+		return nil, err
+	}
+	if out.Uncovered == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`
+WITH `+covTargetCTE+`,
+linked AS (SELECT asset_id, source FROM task_asset_links WHERE task_id = $1)
+SELECT a.id, a.type, COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, ''), l.source
+FROM linked l
+JOIN assets a ON a.id = l.asset_id
+WHERE NOT `+covered+`
+ORDER BY (l.source = 'agent') DESC, a.id
+LIMIT $3`, taskID, expID, listLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a ScopeGapAsset
+		if err := rows.Scan(&a.ID, &a.Type, &a.Label, &a.Source); err != nil {
+			return nil, err
+		}
+		out.UncoveredAssets = append(out.UncoveredAssets, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *AssetStore) TaskCoverage(taskID, expID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1`, taskID).Scan(&cov.ScopeRows)

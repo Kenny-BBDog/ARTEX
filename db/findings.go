@@ -38,6 +38,12 @@ type DBFinding struct {
 
 // Finding triage states (findings.status).
 const (
+	// FindingCandidate is the state every machine-reported finding starts in: a worker
+	// asserted it via report_finding, but nothing has independently reproduced it yet.
+	// prove_goal refuses a candidate as evidence (see agent.ToolSet.proveGoal) — that is
+	// what stops a self-reported vulnerability from unilaterally ending a task. The
+	// verifier agent promotes it to FindingConfirmed.
+	FindingCandidate     = "candidate"      // 待验证(worker 自报，尚未独立复现)
 	FindingPending       = "pending"        // 待处理
 	FindingInProgress    = "in_progress"    // 处理中
 	FindingConfirmed     = "confirmed"      // 已确认(真实漏洞,未修复)
@@ -52,7 +58,7 @@ const (
 // ValidFindingStatus reports whether s is a known triage state.
 func ValidFindingStatus(s string) bool {
 	switch s {
-	case FindingPending, FindingInProgress, FindingConfirmed, FindingResolved, FindingFixed,
+	case FindingCandidate, FindingPending, FindingInProgress, FindingConfirmed, FindingResolved, FindingFixed,
 		FindingFalsePositive, FindingIgnored, FindingDuplicate, FindingRiskAccepted:
 		return true
 	}
@@ -79,6 +85,9 @@ func ValidSeverity(s string) bool {
 // AddFinding inserts a finding into the standalone findings table. taskID and
 // nodeID may be 0 (stored as NULL). name may be "" (frontend falls back to
 // vulnclass). Returns the new finding id.
+//
+// Like RecordFindingTx it starts the row in FindingCandidate: every finding enters
+// unverified, and only a verification (or a human) promotes it.
 func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	aidsJSON, _ := json.Marshal(assetIDs)
 	if assetIDs == nil {
@@ -93,9 +102,9 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	}
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), FindingCandidate,
 	).Scan(&id)
 	return id, err
 }
@@ -462,6 +471,7 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 	if err := tx.Commit(); err != nil {
 		return 0, Activity{}, err
 	}
+	s.bumpGraph()
 	return intentID, audit, nil
 }
 
@@ -526,6 +536,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 type FindingStats struct {
 	Total       int                 `json:"total"`
 	Pending     int                 `json:"pending"`
+	Candidate   int                 `json:"candidate"` // 待独立验证；已并入 Pending 一同计作「需关注」
+	Confirmed   int                 `json:"confirmed"` // 已通过独立验证
 	Critical    int                 `json:"critical"`
 	High        int                 `json:"high"`
 	Medium      int                 `json:"medium"`
@@ -551,12 +563,14 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	st := &FindingStats{VulnClasses: []string{}, Tasks: []FindingTaskOption{}}
 	err := d.QueryRow(`SELECT
 		COUNT(*),
-		COUNT(*) FILTER (WHERE status = 'pending'),
+		COUNT(*) FILTER (WHERE status IN ('pending','candidate')),
+		COUNT(*) FILTER (WHERE status = 'candidate'),
+		COUNT(*) FILTER (WHERE status = 'confirmed'),
 		COUNT(*) FILTER (WHERE severity = 'critical'),
 		COUNT(*) FILTER (WHERE severity = 'high'),
 		COUNT(*) FILTER (WHERE severity = 'medium'),
 		COUNT(*) FILTER (WHERE severity = 'low')
-		FROM findings`).Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
+		FROM findings`).Scan(&st.Total, &st.Pending, &st.Candidate, &st.Confirmed, &st.Critical, &st.High, &st.Medium, &st.Low)
 	if err != nil {
 		return nil, err
 	}
@@ -656,6 +670,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 // cascades its edges + node_assets and nulls any activity referencing it. Returns
 // rows affected (0 = no finding with that id).
 func (d *DB) DeleteFinding(id int64) (n int64, err error) {
+	var expID int64
 	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 		if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
 			if errors.Is(err, ErrFindingNotFound) {
@@ -668,13 +683,18 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 			return err
 		}
 		if nodeID.Valid {
-			if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64); err != nil {
+			// RETURNING exploration_id so the graph snapshot cache can be invalidated
+			// for the exploration whose finding node is about to disappear.
+			if err := tx.QueryRow(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding' RETURNING exploration_id`, nodeID.Int64).Scan(&expID); err != nil && err != sql.ErrNoRows {
 				return err
 			}
 		}
 		n = 1
 		return nil
 	})
+	if err == nil {
+		bumpGraphByExp(expID)
+	}
 	return
 }
 

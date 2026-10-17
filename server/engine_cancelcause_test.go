@@ -167,7 +167,7 @@ func TestResumeYieldsFreshContext(t *testing.T) {
 
 func TestTaskPauseCauseSurvivesImmediateResume(t *testing.T) {
 	e := NewEngine(nil)
-	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
+	task := &Task{ID: "t1", notify: make(chan struct{}, 1), workerNotify: make(chan struct{}, 1)}
 	old := e.execContextFor(context.Background(), task.ID)
 	e.Pause(task.ID, agent.AbortPausedByUser)
 	e.Resume(task)
@@ -193,7 +193,7 @@ func TestDeleteCancellationReturnsRunningIntentToFrontier(t *testing.T) {
 
 func TestResumeDoesNotClearDeleteBarrier(t *testing.T) {
 	e := NewEngine(nil)
-	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
+	task := &Task{ID: "t1", notify: make(chan struct{}, 1), workerNotify: make(chan struct{}, 1)}
 	e.paused.Store(task.ID, true)
 	e.deleting.Store(task.ID, true)
 	e.Resume(task)
@@ -206,7 +206,7 @@ func TestBootstrapAdmissionClearsQueuedPauseBarrier(t *testing.T) {
 	e := NewEngine(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
+	task := &Task{ID: "t1", notify: make(chan struct{}, 1), workerNotify: make(chan struct{}, 1)}
 	s := &Server{engine: e, ctx: ctx}
 	e.Pause(task.ID, agent.AbortPausedByUser)
 

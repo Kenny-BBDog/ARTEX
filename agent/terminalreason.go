@@ -44,16 +44,28 @@ var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonAbortedTools:      "运行在工具执行阶段被取消",
 }
 
+// runAbortedByCaller reports whether this run was cut short from the outside — a pause,
+// a planner kill, a task delete or a shutdown — rather than ending on its own budget.
+//
+// The distinction matters to the wrap-up write-back: an aborted run has no conclusion to
+// record. Its intent goes back to the frontier (pause) or is marked stopped (kill), so
+// stamping a "here is what this route concluded" fact on it would assert an outcome that
+// never happened. A run that stopped itself — completed, hit MaxTurns, hit MaxDuration,
+// or died on a provider error — did reach a verdict, even when that verdict is "unknown".
+func runAbortedByCaller(ctx context.Context, reason harness.TerminalReason) bool {
+	if reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools {
+		return true
+	}
+	// Prompt may return ctx.Err directly without a terminal event. Preserve the
+	// cancellation cause instead of falling back to an empty/unknown terminal reason.
+	return reason == "" && ctx.Err() != nil
+}
+
 // terminalText renders a terminal event with no final text into a compact summary
 // and a Markdown detail block.
 func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (string, string) {
 	reason := term.Reason
-	aborted := reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools
-	// Prompt may return ctx.Err directly without a terminal event. Preserve the
-	// cancellation cause instead of falling back to an empty/unknown terminal reason.
-	if reason == "" && ctx.Err() != nil {
-		aborted = true
-	}
+	aborted := runAbortedByCaller(ctx, reason)
 
 	var sum string
 	if aborted {

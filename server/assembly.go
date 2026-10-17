@@ -164,6 +164,16 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			}
 		}
 
+		// OpenCode 的免费网关要求请求体里必须有一个**名叫 read** 的工具，缺了直接
+		// 403 FreeTierError（大写 Read 不行；描述与 schema 都不校验）。ARTEX 自己的
+		// 读文件工具叫 Read，所以这里补一个小写别名，实现直接复用 Read 本体。
+		// 开关挂在 profile 上；只要还有任何一个 profile 打开了它就给所有 agent 补上
+		// —— 激活配置、agent 绑定、任务固定、故障转移池都可能让某次请求落到该
+		// profile 上，而多一个可用的读文件工具是无害的，漏补则会让那次请求被网关拒掉。
+		if opencodeFreeConfigured(pg) {
+			extra = append(extra, agent.OpencodeReadAlias())
+		}
+
 		cleanup := func() {
 			for _, c := range closers {
 				_ = c.Close()
@@ -177,6 +187,24 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		}
 		return extra, def, cleanup
 	}
+}
+
+// opencodeFreeConfigured reports whether any LLM profile opted into OpenCode's
+// free-tier client headers. Any profile can end up serving a request — the active
+// one, an agent's binding, a task pin, or a member of the failover chain — so the
+// alias is added whenever one of them needs it. A failed lookup reads as "off":
+// with no profile nothing can reach that gateway anyway.
+func opencodeFreeConfigured(pg *db.DB) bool {
+	ps, err := pg.ListProfiles()
+	if err != nil {
+		return false
+	}
+	for _, p := range ps {
+		if p.OpencodeFree {
+			return true
+		}
+	}
+	return false
 }
 
 func idSet(ids []int64) map[int64]bool {

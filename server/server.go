@@ -114,6 +114,16 @@ type Server struct {
 	taskAgentMu sync.Mutex
 	taskAgents  map[string]*taskAgentBundle
 
+	// agentBindingByKey memoizes each agent key's configured LLM profile binding.
+	// effectiveProfileForAgent sits on the worker's idle-poll path and resolves every
+	// role on every iteration; without this each poll costs one SELECT per role. A nil
+	// value is a real entry meaning "the agent exists but binds no profile", so a
+	// cached negative is not re-queried. Only successful lookups are stored, so a
+	// transient DB error keeps the previous (uncached) fall-through behaviour.
+	// Cleared wherever agents or profiles change, via invalidateTaskAgents.
+	agentBindMu       sync.RWMutex
+	agentBindingByKey map[string]*int64
+
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
@@ -138,6 +148,11 @@ type triggeredRun struct {
 	taskDesc  string // 任务描述(任务级,同任务相同);合并时只渲染一次
 	taskGoal  string // 任务目标(任务级,同任务相同);合并时只渲染一次
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
+	// findingID 是本次触发【为哪一个漏洞】而发：report_finding 触发器从工具返回里
+	// 解出该次登记的 finding_id 带进来，run 的 ctx 随之带上同一个作用域，verifier
+	// 的读写工具便只能落在这一条上。0 = 未限定(record_fact 等非 finding 触发)。
+	// 带作用域的 run 不参与合并——合并会把多条 finding 揉进一次运行，绑定随即失效。
+	findingID int64
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
@@ -333,6 +348,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.OpencodeFree = p.OpencodeFree
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -485,6 +501,8 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// wake the active task so a task created while idle starts exploring.
 	if t := s.m.ActiveTask(); t != nil {
 		t.Notify()
+		// Workers blocked because no provider resolved yet must re-check now.
+		t.NotifyWorker()
 	}
 	return nil
 }
@@ -504,6 +522,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.OpencodeFree = p.OpencodeFree
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -517,12 +536,49 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 // can't happen (FK ON DELETE SET NULL); an otherwise-invalid one is dropped downstream
 // by loadProfileConfig, letting the caller fall back.
 func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 {
-	if s.m.pg != nil && agentKey != "" {
-		if a, _ := s.m.pg.GetAgentByKey(agentKey); a != nil && a.LLMProfileID != nil {
-			return a.LLMProfileID
-		}
+	if s.m.pg == nil || agentKey == "" {
+		return pinID
+	}
+	if bound, ok := s.cachedAgentBinding(agentKey); ok && bound != nil {
+		return bound
 	}
 	return pinID
+}
+
+// cachedAgentBinding returns the profile id an agent is bound to, memoized.
+// ok=false means "no cached answer" (nil DB, or the lookup failed) — the caller then
+// uses pinID, exactly as the uncached code did. A non-nil ok with a nil id means the
+// agent genuinely has no binding.
+func (s *Server) cachedAgentBinding(agentKey string) (bound *int64, ok bool) {
+	s.agentBindMu.RLock()
+	bound, ok = s.agentBindingByKey[agentKey]
+	s.agentBindMu.RUnlock()
+	if ok {
+		return bound, true
+	}
+
+	a, err := s.m.pg.GetAgentByKey(agentKey)
+	if err != nil {
+		return nil, false // transient failure: don't memoize it
+	}
+	if a != nil && a.LLMProfileID != nil {
+		bound = a.LLMProfileID
+	}
+
+	s.agentBindMu.Lock()
+	if s.agentBindingByKey == nil {
+		s.agentBindingByKey = map[string]*int64{}
+	}
+	s.agentBindingByKey[agentKey] = bound
+	s.agentBindMu.Unlock()
+	return bound, true
+}
+
+// invalidateAgentBindings drops the memoized agent→profile bindings.
+func (s *Server) invalidateAgentBindings() {
+	s.agentBindMu.Lock()
+	s.agentBindingByKey = map[string]*int64{}
+	s.agentBindMu.Unlock()
 }
 
 // resolveChatAgent picks the ChatAgent for one conversation: the agent's own
@@ -699,6 +755,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/restore/batch", s.restoreTaskArchivesBatch)
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
+	mux.HandleFunc("GET /api/tasks/{id}/outcome", s.getTaskOutcome)
+	mux.HandleFunc("GET /api/outcomes", s.listTaskOutcomes)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
@@ -763,6 +821,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/verifications", s.listFindingVerifications)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
@@ -1375,6 +1434,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		// OpencodeFree 用指针做三态：nil=表单没带，回落到指定 profile 存的值；true/false=
+		// 按表单来。缺了它，带该开关的 profile 会"对话通、点测试 403"。
+		OpencodeFree *bool `json:"opencode_free"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1394,16 +1456,24 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	// OpenCode 免费档的开关同理：测试路径必须按该 profile 的取值发那套头，否则会
+	// "对话通、点测试却 403 FreeTierError"。表单带了就按表单，没带则回落到 profile。
+	if req.OpencodeFree != nil {
+		cfg.OpencodeFree = *req.OpencodeFree
+	}
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
-	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	// 会话头名与 opencode 开关同理：表单未带时用已存 profile 的值兜底。
+	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "" || req.OpencodeFree == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
+			}
+			if req.OpencodeFree == nil {
+				cfg.OpencodeFree = p.OpencodeFree
 			}
 		}
 	}
@@ -1583,6 +1653,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// live slot and postpones an unavailable task's pause/queue transition until
 	// the call returns; a nudge lets an idle running task resume promptly.
 	t.Notify()
+	t.NotifyWorker() // the new binding may be what unblocks an idle worker
 	go s.reconcileConcurrency()
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{

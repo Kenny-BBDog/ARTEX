@@ -563,6 +563,9 @@ func (s *ExplorationStore) SetIntentBlockedReason(id int64, reason string) error
 	_, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now()
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
+	if err == nil {
+		s.bumpGraph()
+	}
 	return err
 }
 
@@ -574,5 +577,6 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked' AND blocked_reason
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	s.bumpGraph()
 	return n, nil
 }

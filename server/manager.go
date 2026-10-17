@@ -63,8 +63,13 @@ type Task struct {
 	Store                *pgdb.ExplorationStore `json:"-"`
 	Guard                *guard.Guard           `json:"-"`
 	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	// workerNotify is the worker pool's wake channel, separate from notify on purpose:
+	// a capacity-1 channel hands each signal to exactly ONE receiver, so sharing notify
+	// would let the planner swallow a worker's wake-up (and vice versa). Same drop-when-full
+	// semantics — see NotifyWorker.
+	workerNotify chan struct{}
+	lifecycleMu  sync.RWMutex
+	llmMu        sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -846,7 +851,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: guard.NewWithInterceptor(ic),
+		notify: make(chan struct{}, 1), workerNotify: make(chan struct{}, 1),
 	}
 }
 
@@ -1751,6 +1757,23 @@ func (m *Manager) List() []*Task {
 func (t *Task) Notify() {
 	select {
 	case t.notify <- struct{}{}:
+	default:
+	}
+}
+
+// NotifyWorker wakes idle workers so they re-check the frontier immediately instead of
+// on their fallback tick. Call it wherever work may have become claimable or a worker
+// slot may have freed: a planner round that added intents, an intent settling, a resume,
+// a task revive, or a provider becoming ready.
+//
+// Non-blocking with a capacity-1 channel: signals coalesce, so a burst costs one wake.
+// A signal sent while a worker is mid-step is buffered (not lost) and consumed by its
+// next wait; if several pile up they collapse into one extra claim attempt, which is
+// all a worker needs. Idle workers additionally carry a fallback timer, so a signal
+// dropped here can never strand them.
+func (t *Task) NotifyWorker() {
+	select {
+	case t.workerNotify <- struct{}{}:
 	default:
 	}
 }

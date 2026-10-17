@@ -40,6 +40,13 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
+	// verifier 的两个工具必须也在这里。seedVerifierAgent 只把它们写进 tools 目录并绑定给
+	// verifier agent，而 agent 真正能调用的工具对象来自本函数——少了这一行，绑定名在运行时
+	// 解析不到任何东西，模型只会把工具名当 shell 命令 echo 出来（实测退化循环）。
+	tools = append(tools, s.findingVerificationTools()...)
+	// 经验库的「不同的声音」工具：verifier 复查"新观察 vs 既有经验"矛盾时用。
+	// 与上面同一条铁律——只绑定不 produce，模型就会把工具名 echo 成 shell 命令。
+	tools = append(tools, s.lessonConflictTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	custom, err := s.customTools()
 	if err != nil {
@@ -500,6 +507,8 @@ func (s *Server) seedOrchestrationTools() {
 	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
 	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
+	s.seedVerifierAgent()             // 预置「漏洞验证」agent + finding 触发器(一次性)
+	s.upgradeVerifierTriggerMessage() // 老库补迁移:让 verifier 知道本次运行绑定在一条漏洞上(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
